@@ -1,0 +1,43 @@
+agent:
+  max_turns: 80
+  verbose: false
+  reasoning_effort: high
+
+terminal:
+  backend: local
+  cwd: "__WORKSPACE__"
+  timeout: 180
+  home_mode: true
+
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 12000
+  user_char_limit: 8000
+  nudge_interval: 10
+  flush_min_turns: 3
+
+delegation:
+  max_iterations: 40
+
+skills:
+  external_dirs: []
+  creation_nudge_interval: 0
+
+security:
+  redact_secrets: true
+  tirith_enabled: true
+  tirith_path: tirith
+  tirith_timeout: 5
+  tirith_fail_open: true
+
+display:
+  compact: true
+  show_reasoning: false
+  memory_notifications: false
+  streaming: true
+
+session_reset:
+  mode: idle
+  idle_minutes: 720
+

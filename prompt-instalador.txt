@@ -1,0 +1,15 @@
+Quero instalar a Braia da Comunidade ContadorIA com a equipe virtual para escritórios de contabilidade em uma VPS Ubuntu.
+
+Acesse o repositório público:
+https://github.com/superbrainpericiaadm/Braia-esc-contabilidade-Hermes
+
+Leia o arquivo SETUP-HERMES.md inteiro e siga o procedimento na ordem. Peça uma informação por vez. Nunca peça minha senha da VPS na conversa: eu mesmo vou digitá-la diretamente no prompt do SSH. Não mostre nem grave tokens em logs. Antes do primeiro SSH, mostre a fingerprint do servidor para eu confirmar. Não instale skills: o setup deve usar obrigatoriamente a opção --no-skills do Hermes.
+
+Vou fornecer quando você pedir:
+- IP e usuário da VPS; eu digitarei a senha diretamente no SSH quando o terminal pedir;
+- token do bot Telegram criado no @BotFather;
+- meu user_id do Telegram obtido no @userinfobot;
+- autenticação do provedor de IA escolhida no assistente do Hermes;
+- opcionalmente, chaves OpenAI e ElevenLabs para áudio.
+
+Ao final, confirme o status do serviço hermes-contadoria.service e me peça para enviar /start e uma mensagem ao bot. Não declare que o Telegram funciona antes desse teste real.
