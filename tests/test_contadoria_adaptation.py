@@ -92,6 +92,9 @@ def test_existing_marker_update_preserves_local_state_and_adds_operational_artif
         assert (home / name).read_text() == value
     assert (home / "scripts/configure_multi_ai.py").read_bytes() == (ROOT / "scripts/configure_multi_ai.py").read_bytes()
     assert (home / "skills/braia-claude-login/SKILL.md").is_file()
+    assert {path.name for path in (home / "skills").iterdir()} == {"braia-claude-login"}
+    env_template = (ROOT / ".env.example").read_text().lower()
+    assert "anthropic" not in env_template and "claude" not in env_template
     assert any(path.name == "configure_multi_ai.py" for path in backup.rglob("configure_multi_ai.py"))
 
 
@@ -100,8 +103,221 @@ def test_existing_install_is_validated_before_mutation_and_coordinates_service()
     preflight = install.index('--check >/dev/null')
     assert preflight < install.index("apt-get update")
     assert preflight < install.index("bash \"${INSTALLER_TMP}\"")
-    assert install.index("systemctl stop hermes-contadoria.service") < install.index("bash \"${INSTALLER_TMP}\"")
-    assert "SERVICE_WAS_ACTIVE" in install and "systemctl start hermes-contadoria.service" in install
+    stop = install.index("stop_service_for_update")
+    runtime = install.index("begin_runtime_transaction")
+    begin = install.index("begin_kit_artifact_transaction")
+    artifacts = install.index('install_kit_artifacts "${SOURCE_DIR}"')
+    assert stop < runtime < begin < artifacts
+    lock = install.index("HERMES_HOME_LOCKED=true", stop)
+    assert lock < install.index('chown -R root:root "${HERMES_HOME}"')
+    assert artifacts < install.index("bash \"${INSTALLER_TMP}\"")
+    assert install.index("restore_service_state ||") < install.index("commit_kit_artifact_transaction")
+    assert install.index("commit_runtime_transaction") < install.index('unlink -- "${KIT_IN_PROGRESS_MARKER}"')
+    assert 'source "${SOURCE_DIR}/scripts/service_transaction.sh"' in install
+    assert 'source "${SOURCE_DIR}/scripts/runtime_transaction.sh"' in install
+    assert 'rollback_kit_artifacts' in install
+    assert 'restore_service_state' in install
+
+
+def _run_failed_service_transaction(tmp_path, initial_state):
+    state = tmp_path / "state"
+    events = tmp_path / "events"
+    state.write_text(initial_state)
+    script = r'''
+set -Eeuo pipefail
+SERVICE_NAME=hermes-contadoria.service
+STATE_FILE="$1"
+EVENTS_FILE="$2"
+HELPER="$3"
+systemctl() {
+  printf '%s\n' "$*" >> "$EVENTS_FILE"
+  case "$1" in
+    is-active) [[ "$(<"$STATE_FILE")" == active ]] || return 3 ;;
+    stop) printf 'inactive' > "$STATE_FILE" ;;
+    start) printf 'active' > "$STATE_FILE" ;;
+    *) return 64 ;;
+  esac
+}
+. "$HELPER"
+cleanup() {
+  status=$?
+  trap - EXIT
+  restore_service_state
+  exit "$status"
+}
+trap cleanup EXIT
+capture_service_state
+stop_service_for_update
+exit 41
+'''
+    result = subprocess.run(
+        ["bash", "-c", script, "transaction-test", str(state), str(events),
+         str(ROOT / "scripts/service_transaction.sh")],
+        text=True,
+    )
+    return result, state.read_text(), events.read_text().splitlines()
+
+
+def test_failure_after_stop_restores_previously_active_service(tmp_path):
+    result, state, events = _run_failed_service_transaction(tmp_path, "active")
+    assert result.returncode == 41
+    assert state == "active"
+    assert "stop hermes-contadoria.service" in events
+    assert "start hermes-contadoria.service" in events
+
+
+def test_failure_preserves_previously_inactive_service(tmp_path):
+    result, state, events = _run_failed_service_transaction(tmp_path, "inactive")
+    assert result.returncode == 41
+    assert state == "inactive"
+    assert "stop hermes-contadoria.service" not in events
+    assert "start hermes-contadoria.service" not in events
+
+
+def test_failed_update_rolls_back_artifacts_before_service_can_observe_them(tmp_path):
+    state = tmp_path / "state"
+    source = tmp_path / "new-artifact"
+    target = tmp_path / "live-artifact"
+    source_two = tmp_path / "new-artifact-two"
+    target_two = tmp_path / "live-artifact-two"
+    backup = tmp_path / "backup"
+    observed = tmp_path / "observed-on-start"
+    state.write_text("active")
+    source.write_text("new-partial")
+    target.write_text("old-consistent")
+    source_two.write_text("new-partial-two")
+    target_two.write_text("old-consistent-two")
+    user = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    script = r'''
+set -Eeuo pipefail
+SERVICE_NAME=hermes-contadoria.service
+STATE_FILE="$1"; SOURCE_FILE="$2"; TARGET_FILE="$3"; SOURCE_TWO="$4"; TARGET_TWO="$5"
+BACKUP="$6"; OBSERVED="$7"; OWNER="$8"; GROUP="$9"; SERVICE_HELPER="${10}"; ARTIFACT_HELPER="${11}"
+systemctl() {
+  case "$1" in
+    is-active) [[ "$(<"$STATE_FILE")" == active ]] || return 3 ;;
+    stop) printf 'inactive' > "$STATE_FILE" ;;
+    start) printf '%s|%s' "$(<"$TARGET_FILE")" "$(<"$TARGET_TWO")" > "$OBSERVED"; printf 'active' > "$STATE_FILE" ;;
+    *) return 64 ;;
+  esac
+}
+. "$SERVICE_HELPER"
+. "$ARTIFACT_HELPER"
+cleanup() {
+  status=$?
+  trap - EXIT
+  quiesce_service_for_recovery
+  rollback_kit_artifacts
+  restore_service_state
+  exit "$status"
+}
+trap cleanup EXIT
+capture_service_state
+stop_service_for_update
+begin_kit_artifact_transaction "$BACKUP" "$OWNER" "$GROUP"
+install_versioned "$SOURCE_FILE" "$TARGET_FILE" 0644 "$OWNER" "$GROUP" "$BACKUP"
+install_versioned "$SOURCE_TWO" "$TARGET_TWO" 0644 "$OWNER" "$GROUP" "$BACKUP"
+[[ "$(<"$TARGET_FILE")" == new-partial ]]
+[[ "$(<"$TARGET_TWO")" == new-partial-two ]]
+restore_service_state
+exit 41
+'''
+    result = subprocess.run(
+        ["bash", "-c", script, "artifact-test", str(state), str(source), str(target),
+         str(source_two), str(target_two), str(backup), str(observed), user, group,
+         str(ROOT / "scripts/service_transaction.sh"),
+         str(ROOT / "scripts/install_kit_artifacts.sh")],
+        text=True,
+    )
+    assert result.returncode == 41
+    assert state.read_text() == "active"
+    assert target.read_text() == "old-consistent"
+    assert target_two.read_text() == "old-consistent-two"
+    assert observed.read_text() == "old-consistent|old-consistent-two"
+
+
+def test_artifact_transaction_rejects_symlink_target(tmp_path):
+    source = tmp_path / "source"
+    outside = tmp_path / "outside"
+    target = tmp_path / "target"
+    backup = tmp_path / "backup"
+    source.write_text("new")
+    outside.write_text("outside-safe")
+    target.symlink_to(outside)
+    user = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    command = r'''
+. "$HELPER"
+begin_kit_artifact_transaction "$BACKUP" "$OWNER" "$GROUP"
+install_versioned "$SOURCE_FILE" "$TARGET_FILE" 0644 "$OWNER" "$GROUP" "$BACKUP"
+'''
+    result = subprocess.run(
+        ["bash", "-c", command],
+        env={**os.environ, "HELPER": str(ROOT / "scripts/install_kit_artifacts.sh"),
+             "BACKUP": str(backup), "OWNER": user, "GROUP": group,
+             "SOURCE_FILE": str(source), "TARGET_FILE": str(target)},
+    )
+    assert result.returncode != 0
+    assert target.is_symlink()
+    assert outside.read_text() == "outside-safe"
+
+
+def test_runtime_transaction_restores_whole_previous_tree(tmp_path):
+    runtime = tmp_path / "runtime"
+    transaction_root = tmp_path / "transactions"
+    runtime.mkdir()
+    (runtime / "managed.py").write_text("old-consistent")
+    user = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    command = r'''
+. "$HELPER"
+begin_runtime_transaction "$RUNTIME" "$TRANSACTIONS" "$OWNER" "$GROUP"
+printf 'new-partial' > "$RUNTIME/managed.py"
+printf 'new-file' > "$RUNTIME/partial.py"
+rollback_runtime_transaction "$RUNTIME"
+'''
+    subprocess.run(
+        ["bash", "-c", command], check=True,
+        env={**os.environ, "HELPER": str(ROOT / "scripts/runtime_transaction.sh"),
+             "RUNTIME": str(runtime), "TRANSACTIONS": str(transaction_root),
+             "OWNER": user, "GROUP": group},
+    )
+    assert (runtime / "managed.py").read_text() == "old-consistent"
+    assert not (runtime / "partial.py").exists()
+
+
+def test_runtime_snapshot_rename_failure_leaves_original_in_place(tmp_path):
+    runtime = tmp_path / "runtime"
+    transaction_root = tmp_path / "transactions"
+    runtime.mkdir()
+    (runtime / "managed.py").write_text("original")
+    user = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    command = r'''
+set -e
+. "$HELPER"
+mv() { return 55; }
+begin_runtime_transaction "$RUNTIME" "$TRANSACTIONS" "$OWNER" "$GROUP"
+'''
+    result = subprocess.run(
+        ["bash", "-c", command],
+        env={**os.environ, "HELPER": str(ROOT / "scripts/runtime_transaction.sh"),
+             "RUNTIME": str(runtime), "TRANSACTIONS": str(transaction_root),
+             "OWNER": user, "GROUP": group},
+    )
+    assert result.returncode == 55
+    assert (runtime / "managed.py").read_text() == "original"
+
+
+def test_distribution_documents_the_single_optional_claude_skill():
+    setup = (ROOT / "SETUP-HERMES.md").read_text(encoding="utf-8")
+    prompt = (ROOT / "prompt-instalador.txt").read_text(encoding="utf-8")
+    for document in (setup, prompt):
+        assert "zero skills" not in document
+        assert "braia-claude-login" in document
+        assert "opcional" in document.lower()
+        assert "conversa" in document.lower()
 
 
 def test_fallback_documentation_is_self_contained():
@@ -111,5 +327,5 @@ def test_fallback_documentation_is_self_contained():
 
 
 def test_shell_scripts_parse():
-    for path in (ROOT / "install.sh", ROOT / "configure.sh", ROOT / "bootstrap.sh", ROOT / "scripts/check-no-secrets.sh", ROOT / "scripts/install_kit_artifacts.sh"):
+    for path in (ROOT / "install.sh", ROOT / "configure.sh", ROOT / "bootstrap.sh", ROOT / "scripts/check-no-secrets.sh", ROOT / "scripts/install_kit_artifacts.sh", ROOT / "scripts/runtime_transaction.sh", ROOT / "scripts/service_transaction.sh"):
         subprocess.run(["bash", "-n", str(path)], check=True)

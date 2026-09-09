@@ -3,7 +3,7 @@ Quero instalar a Braia da Comunidade ContadorIA com a equipe virtual para escrit
 Acesse o repositório público:
 https://github.com/superbrainpericiaadm/Braia-esc-contabilidade-Hermes
 
-Leia o arquivo SETUP-HERMES.md inteiro e siga o procedimento na ordem. Peça uma informação por vez. Nunca peça minha senha da VPS na conversa: eu mesmo vou digitá-la diretamente no prompt do SSH. Não mostre nem grave tokens em logs. Antes do primeiro SSH, mostre a fingerprint do servidor para eu confirmar. Não instale skills: o setup deve usar obrigatoriamente a opção --no-skills do Hermes.
+Leia o arquivo SETUP-HERMES.md inteiro e siga o procedimento na ordem. Peça uma informação por vez. Nunca peça minha senha da VPS na conversa: eu mesmo vou digitá-la diretamente no prompt do SSH. Não mostre nem grave tokens em logs. Antes do primeiro SSH, mostre a fingerprint do servidor para eu confirmar. O setup deve usar obrigatoriamente a opção --no-skills do Hermes e distribuir somente a skill operacional braia-claude-login. Claude continua opcional e deve ser conectado posteriormente apenas quando eu pedir na conversa, sem me mandar ao terminal.
 
 Vou fornecer quando você pedir:
 - IP e usuário da VPS; eu digitarei a senha diretamente no SSH quando o terminal pedir;

@@ -5,7 +5,7 @@ Este manual deve ser seguido pelo agente que estiver ajudando o usuário. Leia t
 ## Resultado esperado
 
 - Hermes oficial instalado em uma VPS Ubuntu;
-- zero skills instaladas;
+- somente a skill operacional `braia-claude-login`, distribuída pelo kit;
 - Braia e os nove papéis contábeis disponíveis por roteamento de persona;
 - Telegram restrito aos IDs informados pelo usuário;
 - serviço `hermes-contadoria.service` ativo após autenticação e configuração.
@@ -67,17 +67,17 @@ Esse script:
 - instala o Hermes oficial fixado por commit;
 - usa obrigatoriamente `--no-skills`;
 - cria o usuário de serviço `hermes-contadoria`;
-- aplica somente os templates públicos deste repositório;
+- aplica somente os templates públicos deste repositório e a skill operacional `braia-claude-login`;
 - instala a unidade `systemd`, mas ainda não a inicia.
 
 Cheque a instalação:
 
 ```bash
 test -f /home/hermes-contadoria/.hermes/.no-bundled-skills
-find /home/hermes-contadoria/.hermes/skills -mindepth 1 -print
+find /home/hermes-contadoria/.hermes/skills -mindepth 1 -maxdepth 1 -type d -printf '%f\n'
 ```
 
-O segundo comando deve produzir zero linhas.
+O segundo comando deve produzir somente `braia-claude-login`. Ela não torna Claude obrigatório: a assinatura é opcional e pode ser conectada posteriormente, quando o usuário pedir na conversa privada. Não peça que o cliente use o terminal para conectar Claude.
 
 ## Etapa 4 — configurar credenciais e autenticação
 

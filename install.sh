@@ -14,16 +14,63 @@ readonly HERMES_COMMIT="${HERMES_COMMIT:-29112bef099274229cadff79cdff7bf7b99c4b7
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER_TMP=""
-SERVICE_WAS_ACTIVE=false
 INSTALL_SUCCEEDED=false
+SERVICE_UNIT_TRANSACTIONAL=false
+HERMES_HOME_LOCKED=false
 
 cleanup() {
+  local status=$?
+  local recovery_ok=true
+  trap - EXIT
   if [[ -n "${INSTALLER_TMP}" && -f "${INSTALLER_TMP}" ]]; then
-    rm -f -- "${INSTALLER_TMP}"
+    if ! unlink -- "${INSTALLER_TMP}"; then
+      printf 'ATENÇÃO: não foi possível retirar o instalador temporário.\n' >&2
+      status=1
+    fi
   fi
-  if [[ "${SERVICE_WAS_ACTIVE}" == true && "${INSTALL_SUCCEEDED}" != true ]]; then
-    printf 'ATENÇÃO: serviço permaneceu parado após falha de atualização; inspecione o runtime antes de iniciar.\n' >&2
+  if [[ "${INSTALL_SUCCEEDED}" != true && "${SERVICE_STATE_CAPTURED:-false}" == true ]]; then
+    if ! quiesce_service_for_recovery; then
+      printf 'ERRO: não foi possível manter o serviço parado durante a recuperação.\n' >&2
+      recovery_ok=false
+      status=1
+    fi
+    if [[ "${recovery_ok}" == true ]]; then
+      if ! rollback_runtime_transaction "${RUNTIME_DIR}"; then
+        printf 'ERRO: não foi possível reverter o runtime.\n' >&2
+        recovery_ok=false
+        status=1
+      fi
+      if ! rollback_kit_artifacts; then
+        printf 'ERRO: não foi possível reverter os artefatos do kit.\n' >&2
+        recovery_ok=false
+        status=1
+      fi
+      if [[ "${SERVICE_UNIT_TRANSACTIONAL}" == true ]] && ! systemctl daemon-reload; then
+        printf 'ERRO: não foi possível recarregar a unidade restaurada.\n' >&2
+        recovery_ok=false
+        status=1
+      fi
+      if [[ "${HERMES_HOME_LOCKED}" == true ]]; then
+        if ! chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${HERMES_HOME}" "${WORKSPACE_DIR}"; then
+          printf 'ERRO: não foi possível restaurar a propriedade da instalação.\n' >&2
+          recovery_ok=false
+          status=1
+        elif ! chmod 0700 "${HERMES_HOME}"; then
+          recovery_ok=false
+          status=1
+        else
+          HERMES_HOME_LOCKED=false
+        fi
+      fi
+    fi
+    if [[ "${recovery_ok}" == true ]] && ! restore_service_state; then
+      printf 'ERRO: não foi possível restaurar o estado anterior do serviço.\n' >&2
+      status=1
+    elif [[ "${recovery_ok}" != true ]]; then
+      printf 'ERRO: serviço mantido parado para não observar estado parcialmente recuperado.\n' >&2
+    fi
   fi
+  exit "${status}"
 }
 trap cleanup EXIT
 
@@ -47,6 +94,8 @@ for required in \
   "${SOURCE_DIR}/scripts/apply_runtime_patch.py" \
   "${SOURCE_DIR}/scripts/configure_multi_ai.py" \
   "${SOURCE_DIR}/scripts/install_kit_artifacts.sh" \
+  "${SOURCE_DIR}/scripts/runtime_transaction.sh" \
+  "${SOURCE_DIR}/scripts/service_transaction.sh" \
   "${SOURCE_DIR}/runtime-patches/delegation-fallback.patch" \
   "${SOURCE_DIR}/runtime-patches/previous-delegation-fallback.patch" \
   "${SOURCE_DIR}/skills/braia-claude-login/SKILL.md" \
@@ -56,6 +105,10 @@ for required in \
 done
 # shellcheck disable=SC1091
 source "${SOURCE_DIR}/scripts/install_kit_artifacts.sh"
+# shellcheck disable=SC1091
+source "${SOURCE_DIR}/scripts/runtime_transaction.sh"
+# shellcheck disable=SC1091
+source "${SOURCE_DIR}/scripts/service_transaction.sh"
 
 if [[ -d "${HERMES_HOME}" && ! -f "${KIT_MARKER}" && ! -f "${KIT_IN_PROGRESS_MARKER}" ]]; then
   existing_item="$(find "${HERMES_HOME}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
@@ -63,6 +116,10 @@ if [[ -d "${HERMES_HOME}" && ! -f "${KIT_MARKER}" && ! -f "${KIT_IN_PROGRESS_MAR
 fi
 if [[ -d "${RUNTIME_DIR}" && ! -f "${KIT_MARKER}" && ! -f "${KIT_IN_PROGRESS_MARKER}" ]]; then
   fail "${RUNTIME_DIR} já existe sem o marcador deste kit; nada foi sobrescrito"
+fi
+if [[ -d "${HERMES_HOME}" ]]; then
+  unexpected_link="$(find "${HERMES_HOME}" -type l -print -quit 2>/dev/null || true)"
+  [[ -z "${unexpected_link}" ]] || fail "link simbólico não permitido na instalação: ${unexpected_link}"
 fi
 
 # Valide a atualização existente antes de apt, download, parada ou mutação do runtime.
@@ -82,20 +139,26 @@ getent group "${SERVICE_GROUP}" >/dev/null || groupadd --system "${SERVICE_GROUP
 id "${SERVICE_USER}" >/dev/null 2>&1 || useradd --system --create-home --home-dir "${SERVICE_HOME}" --gid "${SERVICE_GROUP}" --shell /bin/bash "${SERVICE_USER}"
 install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${HERMES_HOME}" "${WORKSPACE_DIR}"
 
+capture_service_state
+stop_service_for_update
+HERMES_HOME_LOCKED=true
+chown -R root:root "${HERMES_HOME}"
+chmod 0700 "${HERMES_HOME}"
+begin_runtime_transaction "${RUNTIME_DIR}" /opt/.hermes-contadoria-runtime-transactions root root
+
+artifact_backup="/var/backups/hermes-contadoria/kit-artifacts/$(date -u +%Y%m%dT%H%M%SZ)"
+begin_kit_artifact_transaction "${artifact_backup}" root root
+register_kit_artifact_target "${KIT_MARKER}" "${SERVICE_USER}" "${SERVICE_GROUP}"
+# O marcador de retomada fica fora do rollback para permitir repetição após falha inicial.
+
 if [[ ! -f "${KIT_MARKER}" && ! -f "${KIT_IN_PROGRESS_MARKER}" ]]; then
-  printf '%s\n' "Instalação do kit Comunidade ContadorIA em andamento." "Hermes commit: ${HERMES_COMMIT}" > "${KIT_IN_PROGRESS_MARKER}"
-  chown "${SERVICE_USER}:${SERVICE_GROUP}" "${KIT_IN_PROGRESS_MARKER}"
-  chmod 0644 "${KIT_IN_PROGRESS_MARKER}"
+  marker_tmp="$(mktemp)"
+  printf '%s\n' "Instalação do kit Comunidade ContadorIA em andamento." "Hermes commit: ${HERMES_COMMIT}" > "${marker_tmp}"
+  atomic_install_artifact "${marker_tmp}" "${KIT_IN_PROGRESS_MARKER}" 0644 "${SERVICE_USER}" "${SERVICE_GROUP}"
+  unlink -- "${marker_tmp}"
 fi
 
-artifact_backup="${HERMES_HOME}/backups/kit-artifacts/$(date -u +%Y%m%dT%H%M%SZ)"
 install_kit_artifacts "${SOURCE_DIR}" "${HERMES_HOME}" "${SERVICE_USER}" "${SERVICE_GROUP}" "${artifact_backup}" "${WORKSPACE_DIR}"
-
-if systemctl is-active --quiet hermes-contadoria.service; then
-  SERVICE_WAS_ACTIVE=true
-  printf '>> Parando temporariamente o serviço para atualizar o runtime de forma coerente...\n'
-  systemctl stop hermes-contadoria.service
-fi
 
 printf '>> Baixando o instalador oficial do Hermes no commit fixado %s...\n' "${HERMES_COMMIT}"
 INSTALLER_TMP="$(mktemp /tmp/hermes-contadoria-install.XXXXXX)"
@@ -116,10 +179,10 @@ chown -R "root:${SERVICE_GROUP}" "${RUNTIME_DIR}"
 chmod -R g+rX,o-rwx "${RUNTIME_DIR}"
 
 if [[ ! -f "${KIT_MARKER}" ]]; then
-  printf '%s\n' "Comunidade ContadorIA kit" "Hermes commit: ${HERMES_COMMIT}" > "${KIT_MARKER}"
-  chown "${SERVICE_USER}:${SERVICE_GROUP}" "${KIT_MARKER}"
-  chmod 0644 "${KIT_MARKER}"
-  rm -f -- "${KIT_IN_PROGRESS_MARKER}"
+  marker_tmp="$(mktemp)"
+  printf '%s\n' "Comunidade ContadorIA kit" "Hermes commit: ${HERMES_COMMIT}" > "${marker_tmp}"
+  atomic_install_artifact "${marker_tmp}" "${KIT_MARKER}" 0644 "${SERVICE_USER}" "${SERVICE_GROUP}"
+  unlink -- "${marker_tmp}"
 else
   printf '>> Kit atualizado; identidade, agentes, configuração e credenciais locais foram preservados.\n'
 fi
@@ -127,15 +190,18 @@ fi
 [[ -f "${HERMES_HOME}/.no-bundled-skills" ]] || fail "o marcador .no-bundled-skills não foi criado"
 [[ -f "${HERMES_HOME}/skills/braia-claude-login/SKILL.md" ]] || fail "skill operacional de login Claude não foi instalada"
 [[ -x "${HERMES_HOME}/scripts/configure_multi_ai.py" ]] || fail "configurador multi-IA não foi instalado"
-install -m 0644 "${SOURCE_DIR}/templates/hermes-contadoria.service.tpl" /etc/systemd/system/hermes-contadoria.service
+register_kit_artifact_target "/etc/systemd/system/hermes-contadoria.service" root root
+SERVICE_UNIT_TRANSACTIONAL=true
+atomic_install_artifact "${SOURCE_DIR}/templates/hermes-contadoria.service.tpl" \
+  /etc/systemd/system/hermes-contadoria.service 0644 root root
 systemctl daemon-reload
 chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${HERMES_HOME}" "${WORKSPACE_DIR}"
 chmod 0700 "${HERMES_HOME}"
 chmod 0600 "${HERMES_HOME}/.env"
-if [[ "${SERVICE_WAS_ACTIVE}" == true ]]; then
-  systemctl start hermes-contadoria.service
-  systemctl is-active --quiet hermes-contadoria.service || fail "serviço anterior não voltou ao estado ativo"
-fi
+restore_service_state || fail "serviço não voltou ao estado anterior"
+commit_kit_artifact_transaction
+commit_runtime_transaction
+[[ ! -f "${KIT_IN_PROGRESS_MARKER}" ]] || unlink -- "${KIT_IN_PROGRESS_MARKER}"
 INSTALL_SUCCEEDED=true
 
 printf '\nInstalação-base concluída. Serviço anterior restaurado, se aplicável.\n'
