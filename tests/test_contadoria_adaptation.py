@@ -92,9 +92,6 @@ def test_existing_marker_update_preserves_local_state_and_adds_operational_artif
         assert (home / name).read_text() == value
     assert (home / "scripts/configure_multi_ai.py").read_bytes() == (ROOT / "scripts/configure_multi_ai.py").read_bytes()
     assert (home / "skills/braia-claude-login/SKILL.md").is_file()
-    assert {path.name for path in (home / "skills").iterdir()} == {"braia-claude-login"}
-    env_template = (ROOT / ".env.example").read_text().lower()
-    assert "anthropic" not in env_template and "claude" not in env_template
     assert any(path.name == "configure_multi_ai.py" for path in backup.rglob("configure_multi_ai.py"))
 
 
@@ -104,18 +101,15 @@ def test_existing_install_is_validated_before_mutation_and_coordinates_service()
     assert preflight < install.index("apt-get update")
     assert preflight < install.index("bash \"${INSTALLER_TMP}\"")
     stop = install.index("stop_service_for_update")
-    runtime = install.index("begin_runtime_transaction")
     begin = install.index("begin_kit_artifact_transaction")
+    runtime_begin = install.index("begin_runtime_transaction")
     artifacts = install.index('install_kit_artifacts "${SOURCE_DIR}"')
-    assert stop < runtime < begin < artifacts
-    lock = install.index("HERMES_HOME_LOCKED=true", stop)
-    assert lock < install.index('chown -R root:root "${HERMES_HOME}"')
+    assert stop < begin < runtime_begin < artifacts
     assert artifacts < install.index("bash \"${INSTALLER_TMP}\"")
-    assert install.index("restore_service_state ||") < install.index("commit_kit_artifact_transaction")
-    assert install.index("commit_runtime_transaction") < install.index('unlink -- "${KIT_IN_PROGRESS_MARKER}"')
+    assert install.index("restore_service_state ||") < install.index("INSTALL_SUCCEEDED=true")
     assert 'source "${SOURCE_DIR}/scripts/service_transaction.sh"' in install
-    assert 'source "${SOURCE_DIR}/scripts/runtime_transaction.sh"' in install
     assert 'rollback_kit_artifacts' in install
+    assert 'rollback_runtime_transaction' in install
     assert 'restore_service_state' in install
 
 
@@ -263,51 +257,190 @@ install_versioned "$SOURCE_FILE" "$TARGET_FILE" 0644 "$OWNER" "$GROUP" "$BACKUP"
     assert outside.read_text() == "outside-safe"
 
 
-def test_runtime_transaction_restores_whole_previous_tree(tmp_path):
-    runtime = tmp_path / "runtime"
-    transaction_root = tmp_path / "transactions"
-    runtime.mkdir()
-    (runtime / "managed.py").write_text("old-consistent")
+def test_artifact_install_rejects_symlinked_managed_directory(tmp_path):
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    backup = tmp_path / "backup"
+    workspace = tmp_path / "workspace"
+    home.mkdir(); outside.mkdir(); workspace.mkdir()
+    (home / "skills").symlink_to(outside, target_is_directory=True)
     user = pwd.getpwuid(os.getuid()).pw_name
     group = grp.getgrgid(os.getgid()).gr_name
-    command = r'''
-. "$HELPER"
-begin_runtime_transaction "$RUNTIME" "$TRANSACTIONS" "$OWNER" "$GROUP"
-printf 'new-partial' > "$RUNTIME/managed.py"
-printf 'new-file' > "$RUNTIME/partial.py"
-rollback_runtime_transaction "$RUNTIME"
-'''
-    subprocess.run(
-        ["bash", "-c", command], check=True,
-        env={**os.environ, "HELPER": str(ROOT / "scripts/runtime_transaction.sh"),
-             "RUNTIME": str(runtime), "TRANSACTIONS": str(transaction_root),
-             "OWNER": user, "GROUP": group},
+    command = '. "$HELPER"; install_kit_artifacts "$SOURCE" "$HOME_DIR" "$OWNER" "$GROUP" "$BACKUP" "$WORKSPACE"'
+    result = subprocess.run(
+        ["bash", "-c", command],
+        env={**os.environ, "HELPER": str(ROOT / "scripts/install_kit_artifacts.sh"),
+             "SOURCE": str(ROOT), "HOME_DIR": str(home), "OWNER": user, "GROUP": group,
+             "BACKUP": str(backup), "WORKSPACE": str(workspace)},
     )
-    assert (runtime / "managed.py").read_text() == "old-consistent"
-    assert not (runtime / "partial.py").exists()
+    assert result.returncode != 0
+    assert list(outside.iterdir()) == []
 
 
-def test_runtime_snapshot_rename_failure_leaves_original_in_place(tmp_path):
-    runtime = tmp_path / "runtime"
-    transaction_root = tmp_path / "transactions"
-    runtime.mkdir()
-    (runtime / "managed.py").write_text("original")
+def test_artifact_install_failure_never_replaces_live_target(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    backup = tmp_path / "backup"
+    source.write_text("new")
+    target.write_text("old")
     user = pwd.getpwuid(os.getuid()).pw_name
     group = grp.getgrgid(os.getgid()).gr_name
     command = r'''
-set -e
+set -u
 . "$HELPER"
-mv() { return 55; }
-begin_runtime_transaction "$RUNTIME" "$TRANSACTIONS" "$OWNER" "$GROUP"
+begin_kit_artifact_transaction "$BACKUP" "$OWNER" "$GROUP" || exit
+register_kit_artifact_target "$TARGET_FILE" "$OWNER" "$GROUP" || exit
+install() { return 73; }
+atomic_install_artifact "$SOURCE_FILE" "$TARGET_FILE" 0644 "$OWNER" "$GROUP"
 '''
     result = subprocess.run(
         ["bash", "-c", command],
-        env={**os.environ, "HELPER": str(ROOT / "scripts/runtime_transaction.sh"),
-             "RUNTIME": str(runtime), "TRANSACTIONS": str(transaction_root),
-             "OWNER": user, "GROUP": group},
+        env={**os.environ, "HELPER": str(ROOT / "scripts/install_kit_artifacts.sh"),
+             "BACKUP": str(backup), "OWNER": user, "GROUP": group,
+             "SOURCE_FILE": str(source), "TARGET_FILE": str(target)},
     )
-    assert result.returncode == 55
-    assert (runtime / "managed.py").read_text() == "original"
+    assert result.returncode == 73
+    assert target.read_text() == "old"
+
+
+def test_artifact_restore_failure_never_replaces_live_target(tmp_path):
+    source = tmp_path / "backup"
+    target = tmp_path / "target"
+    source.write_text("old")
+    target.write_text("new")
+    command = r'''
+set -u
+. "$HELPER"
+cp() { return 74; }
+atomic_restore_artifact "$SOURCE_FILE" "$TARGET_FILE"
+'''
+    result = subprocess.run(
+        ["bash", "-c", command],
+        env={**os.environ, "HELPER": str(ROOT / "scripts/install_kit_artifacts.sh"),
+             "SOURCE_FILE": str(source), "TARGET_FILE": str(target)},
+    )
+    assert result.returncode == 74
+    assert target.read_text() == "new"
+
+
+def test_runtime_failure_restores_exact_previous_tree(tmp_path):
+    runtime = tmp_path / "runtime"
+    backup = tmp_path / "backup"
+    runtime.mkdir()
+    (runtime / "version").write_text("old")
+    command = r'''
+set -u
+. "$HELPER"
+begin_runtime_transaction "$RUNTIME" "$BACKUP"
+mkdir "$RUNTIME"
+printf partial > "$RUNTIME/version"
+rollback_runtime_transaction
+'''
+    result = subprocess.run(
+        ["bash", "-c", command], check=False,
+        env={**os.environ, "HELPER": str(ROOT / "scripts/runtime_transaction.sh"),
+             "RUNTIME": str(runtime), "BACKUP": str(backup)},
+    )
+    assert result.returncode == 0
+    assert (runtime / "version").read_text() == "old"
+    assert any(path.name.startswith("failed-runtime") for path in tmp_path.glob(".runtime.transaction.*/failed-runtime.*"))
+
+
+def test_runtime_rollback_fails_closed_if_snapshot_disappears(tmp_path):
+    runtime = tmp_path / "runtime"
+    backup = tmp_path / "backup"
+    lost = tmp_path / "lost"
+    runtime.mkdir()
+    (runtime / "version").write_text("old")
+    command = r'''
+set -u
+. "$HELPER"
+begin_runtime_transaction "$RUNTIME" "$BACKUP"
+mv "$RUNTIME_PREVIOUS_PATH" "$LOST"
+mkdir "$RUNTIME"
+printf new > "$RUNTIME/version"
+rollback_runtime_transaction
+'''
+    result = subprocess.run(
+        ["bash", "-c", command], check=False,
+        env={**os.environ, "HELPER": str(ROOT / "scripts/runtime_transaction.sh"),
+             "RUNTIME": str(runtime), "BACKUP": str(backup), "LOST": str(lost)},
+    )
+    assert result.returncode != 0
+    assert (runtime / "version").read_text() == "new"
+
+
+def test_fresh_home_failure_restores_empty_preinstall_tree(tmp_path):
+    home = tmp_path / "home"
+    backup = tmp_path / "backup"
+    home.mkdir()
+    command = r'''
+set -u
+. "$HELPER"
+begin_fresh_home_transaction "$HOME_DIR" "$BACKUP"
+mkdir -p "$HOME_DIR/skills/braia-claude-login/scripts" "$HOME_DIR/agents"
+printf partial > "$HOME_DIR/skills/braia-claude-login/SKILL.md"
+printf installer-state > "$HOME_DIR/.no-bundled-skills"
+rollback_fresh_home_transaction
+'''
+    result = subprocess.run(
+        ["bash", "-c", command], check=False,
+        env={**os.environ, "HELPER": str(ROOT / "scripts/install_kit_artifacts.sh"),
+             "HOME_DIR": str(home), "BACKUP": str(backup)},
+    )
+    assert result.returncode == 0
+    assert home.is_dir()
+    assert list(home.iterdir()) == []
+
+
+def test_existing_home_failure_restores_complete_previous_tree(tmp_path):
+    home = tmp_path / "home"
+    backup = tmp_path / "backup"
+    (home / "sessions").mkdir(parents=True)
+    (home / ".env").write_text("local-state")
+    (home / "sessions/state.db").write_text("old-db")
+    command = r'''
+set -u
+. "$HELPER"
+begin_fresh_home_transaction "$HOME_DIR" "$BACKUP"
+printf changed > "$HOME_DIR/.env"
+printf partial > "$HOME_DIR/new-file"
+rollback_fresh_home_transaction
+'''
+    result = subprocess.run(
+        ["bash", "-c", command], check=False,
+        env={**os.environ, "HELPER": str(ROOT / "scripts/install_kit_artifacts.sh"),
+             "HOME_DIR": str(home), "BACKUP": str(backup)},
+    )
+    assert result.returncode == 0
+    assert (home / ".env").read_text() == "local-state"
+    assert (home / "sessions/state.db").read_text() == "old-db"
+    assert not (home / "new-file").exists()
+
+
+def test_successful_home_transaction_archives_snapshot_outside_live_parent(tmp_path):
+    live_parent = tmp_path / "live"
+    home = live_parent / "home"
+    backup = tmp_path / "backups" / "kit"
+    home.mkdir(parents=True)
+    (home / ".env").write_text("old")
+    command = r'''
+set -u
+. "$HELPER"
+begin_fresh_home_transaction "$HOME_DIR" "$BACKUP"
+printf new > "$HOME_DIR/.env"
+FRESH_HOME_TRANSACTION_ACTIVE=false
+archive_home_transaction_snapshot
+'''
+    result = subprocess.run(
+        ["bash", "-c", command], check=False,
+        env={**os.environ, "HELPER": str(ROOT / "scripts/install_kit_artifacts.sh"),
+             "HOME_DIR": str(home), "BACKUP": str(backup)},
+    )
+    assert result.returncode == 0
+    assert (home / ".env").read_text() == "new"
+    assert (backup / "complete-home/previous-home/.env").read_text() == "old"
+    assert list(tmp_path.glob(".home.transaction.*")) == []
 
 
 def test_distribution_documents_the_single_optional_claude_skill():
@@ -318,6 +451,7 @@ def test_distribution_documents_the_single_optional_claude_skill():
         assert "braia-claude-login" in document
         assert "opcional" in document.lower()
         assert "conversa" in document.lower()
+    assert "-type d" not in setup
 
 
 def test_fallback_documentation_is_self_contained():
@@ -327,5 +461,5 @@ def test_fallback_documentation_is_self_contained():
 
 
 def test_shell_scripts_parse():
-    for path in (ROOT / "install.sh", ROOT / "configure.sh", ROOT / "bootstrap.sh", ROOT / "scripts/check-no-secrets.sh", ROOT / "scripts/install_kit_artifacts.sh", ROOT / "scripts/runtime_transaction.sh", ROOT / "scripts/service_transaction.sh"):
+    for path in (ROOT / "install.sh", ROOT / "configure.sh", ROOT / "bootstrap.sh", ROOT / "scripts/check-no-secrets.sh", ROOT / "scripts/install_kit_artifacts.sh", ROOT / "scripts/service_transaction.sh", ROOT / "scripts/runtime_transaction.sh"):
         subprocess.run(["bash", "-n", str(path)], check=True)

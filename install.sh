@@ -16,7 +16,6 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER_TMP=""
 INSTALL_SUCCEEDED=false
 SERVICE_UNIT_TRANSACTIONAL=false
-HERMES_HOME_LOCKED=false
 
 cleanup() {
   local status=$?
@@ -34,34 +33,25 @@ cleanup() {
       recovery_ok=false
       status=1
     fi
-    if [[ "${recovery_ok}" == true ]]; then
-      if ! rollback_runtime_transaction "${RUNTIME_DIR}"; then
-        printf 'ERRO: não foi possível reverter o runtime.\n' >&2
-        recovery_ok=false
-        status=1
-      fi
-      if ! rollback_kit_artifacts; then
-        printf 'ERRO: não foi possível reverter os artefatos do kit.\n' >&2
-        recovery_ok=false
-        status=1
-      fi
-      if [[ "${SERVICE_UNIT_TRANSACTIONAL}" == true ]] && ! systemctl daemon-reload; then
-        printf 'ERRO: não foi possível recarregar a unidade restaurada.\n' >&2
-        recovery_ok=false
-        status=1
-      fi
-      if [[ "${HERMES_HOME_LOCKED}" == true ]]; then
-        if ! chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${HERMES_HOME}" "${WORKSPACE_DIR}"; then
-          printf 'ERRO: não foi possível restaurar a propriedade da instalação.\n' >&2
-          recovery_ok=false
-          status=1
-        elif ! chmod 0700 "${HERMES_HOME}"; then
-          recovery_ok=false
-          status=1
-        else
-          HERMES_HOME_LOCKED=false
-        fi
-      fi
+    if ! rollback_kit_artifacts; then
+      printf 'ERRO: não foi possível reverter os artefatos do kit.\n' >&2
+      recovery_ok=false
+      status=1
+    fi
+    if ! rollback_fresh_home_transaction; then
+      printf 'ERRO: não foi possível restaurar a árvore anterior do HERMES_HOME.\n' >&2
+      recovery_ok=false
+      status=1
+    fi
+    if ! rollback_runtime_transaction; then
+      printf 'ERRO: não foi possível restaurar o runtime anterior.\n' >&2
+      recovery_ok=false
+      status=1
+    fi
+    if [[ "${SERVICE_UNIT_TRANSACTIONAL}" == true ]] && ! systemctl daemon-reload; then
+      printf 'ERRO: não foi possível recarregar a unidade restaurada.\n' >&2
+      recovery_ok=false
+      status=1
     fi
     if [[ "${recovery_ok}" == true ]] && ! restore_service_state; then
       printf 'ERRO: não foi possível restaurar o estado anterior do serviço.\n' >&2
@@ -110,16 +100,21 @@ source "${SOURCE_DIR}/scripts/runtime_transaction.sh"
 # shellcheck disable=SC1091
 source "${SOURCE_DIR}/scripts/service_transaction.sh"
 
+for managed_directory in \
+  "${HERMES_HOME}" "${HERMES_HOME}/agents" "${HERMES_HOME}/skills" \
+  "${HERMES_HOME}/scripts" "${HERMES_HOME}/skills/braia-claude-login" \
+  "${HERMES_HOME}/skills/braia-claude-login/scripts" \
+  "${HERMES_HOME}/backups" "${HERMES_HOME}/backups/runtime"; do
+  assert_safe_artifact_directory "${managed_directory}" || \
+    fail "diretório gerenciado inválido ou ligado simbolicamente: ${managed_directory}"
+done
+
 if [[ -d "${HERMES_HOME}" && ! -f "${KIT_MARKER}" && ! -f "${KIT_IN_PROGRESS_MARKER}" ]]; then
   existing_item="$(find "${HERMES_HOME}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
   [[ -z "${existing_item}" ]] || fail "${HERMES_HOME} já contém outra instalação; nada foi sobrescrito"
 fi
 if [[ -d "${RUNTIME_DIR}" && ! -f "${KIT_MARKER}" && ! -f "${KIT_IN_PROGRESS_MARKER}" ]]; then
   fail "${RUNTIME_DIR} já existe sem o marcador deste kit; nada foi sobrescrito"
-fi
-if [[ -d "${HERMES_HOME}" ]]; then
-  unexpected_link="$(find "${HERMES_HOME}" -type l -print -quit 2>/dev/null || true)"
-  [[ -z "${unexpected_link}" ]] || fail "link simbólico não permitido na instalação: ${unexpected_link}"
 fi
 
 # Valide a atualização existente antes de apt, download, parada ou mutação do runtime.
@@ -137,19 +132,19 @@ apt-get update
 apt-get install -y ca-certificates curl git sudo
 getent group "${SERVICE_GROUP}" >/dev/null || groupadd --system "${SERVICE_GROUP}"
 id "${SERVICE_USER}" >/dev/null 2>&1 || useradd --system --create-home --home-dir "${SERVICE_HOME}" --gid "${SERVICE_GROUP}" --shell /bin/bash "${SERVICE_USER}"
-install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${HERMES_HOME}" "${WORKSPACE_DIR}"
+install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${WORKSPACE_DIR}"
 
 capture_service_state
 stop_service_for_update
-HERMES_HOME_LOCKED=true
-chown -R root:root "${HERMES_HOME}"
-chmod 0700 "${HERMES_HOME}"
-begin_runtime_transaction "${RUNTIME_DIR}" /opt/.hermes-contadoria-runtime-transactions root root
 
 artifact_backup="/var/backups/hermes-contadoria/kit-artifacts/$(date -u +%Y%m%dT%H%M%SZ)"
+begin_fresh_home_transaction "${HERMES_HOME}" "${artifact_backup}"
+install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${HERMES_HOME}"
 begin_kit_artifact_transaction "${artifact_backup}" root root
 register_kit_artifact_target "${KIT_MARKER}" "${SERVICE_USER}" "${SERVICE_GROUP}"
-# O marcador de retomada fica fora do rollback para permitir repetição após falha inicial.
+register_kit_artifact_target "${KIT_IN_PROGRESS_MARKER}" "${SERVICE_USER}" "${SERVICE_GROUP}"
+runtime_backup="/var/backups/hermes-contadoria/runtime/$(date -u +%Y%m%dT%H%M%SZ)"
+begin_runtime_transaction "${RUNTIME_DIR}" "${runtime_backup}"
 
 if [[ ! -f "${KIT_MARKER}" && ! -f "${KIT_IN_PROGRESS_MARKER}" ]]; then
   marker_tmp="$(mktemp)"
@@ -183,6 +178,7 @@ if [[ ! -f "${KIT_MARKER}" ]]; then
   printf '%s\n' "Comunidade ContadorIA kit" "Hermes commit: ${HERMES_COMMIT}" > "${marker_tmp}"
   atomic_install_artifact "${marker_tmp}" "${KIT_MARKER}" 0644 "${SERVICE_USER}" "${SERVICE_GROUP}"
   unlink -- "${marker_tmp}"
+  [[ ! -f "${KIT_IN_PROGRESS_MARKER}" ]] || unlink -- "${KIT_IN_PROGRESS_MARKER}"
 else
   printf '>> Kit atualizado; identidade, agentes, configuração e credenciais locais foram preservados.\n'
 fi
@@ -198,11 +194,18 @@ systemctl daemon-reload
 chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${HERMES_HOME}" "${WORKSPACE_DIR}"
 chmod 0700 "${HERMES_HOME}"
 chmod 0600 "${HERMES_HOME}/.env"
+cleanup_kit_artifact_temporaries || fail "não foi possível limpar temporários da transação"
+[[ -d "${RUNTIME_DIR}" && ! -L "${RUNTIME_DIR}" ]] || fail "runtime novo inválido antes da ativação"
+[[ -d "${HERMES_HOME}" && ! -L "${HERMES_HOME}" ]] || fail "HERMES_HOME novo inválido antes da ativação"
 restore_service_state || fail "serviço não voltou ao estado anterior"
-commit_kit_artifact_transaction
-commit_runtime_transaction
-[[ ! -f "${KIT_IN_PROGRESS_MARKER}" ]] || unlink -- "${KIT_IN_PROGRESS_MARKER}"
 INSTALL_SUCCEEDED=true
+KIT_ARTIFACT_TRANSACTION_ACTIVE=false
+RUNTIME_TRANSACTION_ACTIVE=false
+FRESH_HOME_TRANSACTION_ACTIVE=false
+archive_home_transaction_snapshot || \
+  printf 'ATENÇÃO: snapshot anterior do HERMES_HOME permaneceu na área transacional local.\n' >&2
+archive_runtime_transaction_snapshot || \
+  printf 'ATENÇÃO: snapshot anterior do runtime permaneceu na área transacional local.\n' >&2
 
 printf '\nInstalação-base concluída. Serviço anterior restaurado, se aplicável.\n'
 printf 'Próximo passo para instalação nova: sudo bash configure.sh\n'

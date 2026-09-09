@@ -74,7 +74,7 @@ Cheque a instalação:
 
 ```bash
 test -f /home/hermes-contadoria/.hermes/.no-bundled-skills
-find /home/hermes-contadoria/.hermes/skills -mindepth 1 -maxdepth 1 -type d -printf '%f\n'
+find /home/hermes-contadoria/.hermes/skills -mindepth 1 -maxdepth 1 -printf '%f\n'
 ```
 
 O segundo comando deve produzir somente `braia-claude-login`. Ela não torna Claude obrigatório: a assinatura é opcional e pode ser conectada posteriormente, quando o usuário pedir na conversa privada. Não peça que o cliente use o terminal para conectar Claude.
