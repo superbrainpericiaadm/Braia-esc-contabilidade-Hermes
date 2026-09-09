@@ -1,6 +1,159 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index c67550de78..4ec26e226b 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -3513,7 +3513,7 @@ def run_conversation(
+                     # Eager fallback: empty/malformed responses are a common
+                     # rate-limit symptom.  Switch to fallback immediately
+                     # rather than retrying with extended backoff.
+-                    if agent._fallback_index < len(agent._fallback_chain):
++                    if agent._has_pending_fallback():
+                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
+                     if agent._try_activate_fallback():
+                         active_system_prompt = _sync_failover_system_message(
+@@ -3981,7 +3981,7 @@ def run_conversation(
+                         )
+                         if (
+                             _cf_terminated
+-                            and agent._fallback_index < len(agent._fallback_chain)
++                            and agent._has_pending_fallback()
+                         ):
+                             agent._vprint(
+                                 f"{agent.log_prefix}🛡️  Content filter terminated "
+@@ -5593,7 +5593,12 @@ def run_conversation(
+                     (is_rate_limited and _wrapped_output_cap_budget is None)
+                     or (_is_transport_failure and retry_count >= 2)
+                 )
+-                if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
++                _braia_unavailable_model = (
++                    getattr(agent, "_braia_execution", None) is not None
++                    and classified.reason.value in {"model_not_found", "server_error"}
++                )
++                _should_fallback = _should_fallback or _braia_unavailable_model
++                if _should_fallback and agent._has_pending_fallback():
+                     # Don't eagerly fallback if credential pool rotation may
+                     # still recover.  See _pool_may_recover_from_rate_limit
+                     # for the single-credential-pool exception.  Fixes #11314.
+@@ -5604,7 +5609,7 @@ def run_conversation(
+                     # different model regardless of pool state.
+                     _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
+                     pool_may_recover = (
+-                        False if _is_upstream
++                        False if (_is_upstream or _braia_unavailable_model)
+                         else _ra()._pool_may_recover_from_rate_limit(
+                             agent._credential_pool,
+                         )
+@@ -5663,7 +5668,7 @@ def run_conversation(
+                 if (
+                     classified.is_auth
+                     and not _retry.auth_failover_attempted
+-                    and agent._fallback_index < len(agent._fallback_chain)
++                    and agent._has_pending_fallback()
+                 ):
+                     _retry.auth_failover_attempted = True
+                     agent._buffer_status(
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 7990d88ad2..689f3e2e1c 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2087,7 +2087,9 @@ DEFAULT_CONFIG = {
+     # so child agents can run on a different (cheaper/faster) provider and model.
+     # Uses the same runtime provider resolution as CLI/gateway startup, so all
+     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
++    "braia_routing": {"enabled": False},
+     "delegation": {
++        "fallback_providers": None,  # legacy explicit child fallback chain
+         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
+         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
+diff --git a/run_agent.py b/run_agent.py
+index 9f145baddf..cffec5c979 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -917,7 +917,7 @@ class AIAgent:
+     ):
+         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
+         from agent.agent_runtime_helpers import switch_model
+-        return switch_model(
++        switched = switch_model(
+             self,
+             new_model,
+             new_provider,
+@@ -926,6 +926,10 @@ class AIAgent:
+             api_mode,
+             capabilities,
+         )
++        if (switched is not False and self.provider == new_provider and self.model == new_model
++                and not getattr(self, "_braia_automatic_switch", False)):
++            self._braia_manual_route = (new_provider, new_model)
++        return switched
+
+     def _safe_print(self, *args, **kwargs):
+         """Print that silently handles broken pipes / closed stdout.
+@@ -7112,6 +7116,10 @@ class AIAgent:
+
+     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
++        from agent.braia_routing import route_fallback
++        routed = route_fallback(self, reason)
++        if routed is not None:
++            return routed
+         from agent.chat_completion_helpers import try_activate_fallback
+         return try_activate_fallback(self, reason)
+
+@@ -7123,6 +7131,9 @@ class AIAgent:
+         fallback chain configured).  Mirrors the early-return guard in
+         ``try_activate_fallback`` (#35314, #17446).
+         """
++        state = getattr(self, "_braia_execution", None)
++        if state is not None:
++            return bool(state["alternatives"])
+         chain = getattr(self, "_fallback_chain", None) or []
+         index = getattr(self, "_fallback_index", 0)
+         return index < len(chain)
+@@ -8530,6 +8541,7 @@ class AIAgent:
+         while side-effect ordering is preserved.
+         """
+         tool_calls = assistant_message.tool_calls
++        self._braia_route_batch_safe = len(tool_calls) == 1
+
+         # Allow _vprint during tool execution even with stream consumers
+         self._executing_tools = True
+@@ -8561,6 +8573,7 @@ class AIAgent:
+             )
+         finally:
+             self._executing_tools = False
++            self._braia_route_batch_safe = False
+
+     def _dispatch_delegate_task(self, function_args: dict) -> str:
+         """Single call site for delegate_task dispatch.
+@@ -8687,6 +8700,9 @@ class AIAgent:
+                 logger.debug("Conversation root lineage walk failed", exc_info=True)
+         return start
+
++    from agent.braia_routing import routed_conversation as _braia_routed_conversation
++
++    @_braia_routed_conversation
+     def run_conversation(
+         self,
+         user_message: Any,
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index ea0757143d..e4410efaf5 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -992,6 +992,7 @@ def _push_completion_event(
+         "dispatched_at": dispatched_at,
+         "completed_at": completed_at,
+         "exit_reason": result.get("exit_reason"),
++        "braia_routing": result.get("braia_routing"),
+     }
+     # Routing origin captured at dispatch (see _capture_routing_origin):
+     # additive, lets the gateway reconstruct a full SessionSource (incl.
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index e459344a83..0216bd448f 100644
 --- a/tools/delegate_tool.py
 +++ b/tools/delegate_tool.py
-@@ -1722,6 +1722,7 @@
+@@ -1722,6 +1722,7 @@ def _build_child_agent(
      # 'leaf' (default) cannot; 'orchestrator' retains the delegation
      # toolset subject to depth/kill-switch bounds applied below.
      role: str = "leaf",
@@ -8,10 +161,10 @@
  ):
      """
      Build a child AIAgent on the main thread (thread-safe construction).
-@@ -1975,23 +1976,28 @@
+@@ -1975,23 +1976,28 @@ def _build_child_agent(
      except Exception as exc:
          logger.debug("Could not load delegation reasoning_effort: %s", exc)
- 
+
 -    # Inherit the parent's fallback provider chain so subagents can recover
 -    # from rate-limits and credential exhaustion exactly like the top-level
 -    # agent does.  _fallback_chain is a list accepted by AIAgent's
@@ -51,11 +204,11 @@
 +            routing_spec["effort"],
 +        )
 +        child_fallback = []  # runtime hook supplies bounded capable fallbacks
- 
+
      # Inherit the parent's OpenRouter provider-preference filters by default
      # (so subagents routed to the same provider honour the same routing
-@@ -2081,7 +2087,7 @@
- 
+@@ -2081,7 +2087,7 @@ def _build_child_agent(
+
                  reasoning_config=child_reasoning,
                  prefill_messages=getattr(parent_agent, "prefill_messages", None),
 -                fallback_model=parent_fallback,
@@ -63,7 +216,7 @@
                  enabled_toolsets=child_toolsets,
                  disabled_toolsets=child_disabled_toolsets,
                  quiet_mode=True,
-@@ -2128,6 +2134,10 @@
+@@ -2128,6 +2134,10 @@ def _build_child_agent(
                  except Exception:
                      pass
              raise
@@ -74,17 +227,17 @@
      child._print_fn = getattr(parent_agent, "_print_fn", None)
      # Ownership transfer for the dedicated handle: the child's close() must
      # release it (nothing else holds a reference), and no parent teardown can
-@@ -2207,6 +2217,9 @@
+@@ -2207,6 +2217,9 @@ def _build_child_agent(
      except Exception:
          logger.debug("subagent_start hook invocation failed", exc_info=True)
- 
+
 +    if routing_spec is not None:
 +        from agent.braia_routing import track_child
 +        track_child(child, parent_agent)
      return child
- 
- 
-@@ -3079,6 +3092,8 @@
+
+
+@@ -3079,6 +3092,8 @@ def _run_single_child(
                      f"{_late_pending_steer}]"
                  )
              _attach_worktree(_error_entry)
@@ -93,30 +246,30 @@
              return _error_entry
          finally:
              # Shut down executor without waiting — if the child thread
-@@ -3469,6 +3484,8 @@
+@@ -3469,6 +3484,8 @@ def _run_single_child(
                  logger.debug("Progress callback completion failed: %s", e)
- 
+
          _attach_worktree(entry)
 +        from agent.braia_routing import publish_child_evidence
 +        publish_child_evidence(child, parent_agent, entry)
          return entry
- 
+
      except Exception as exc:
-@@ -3505,9 +3522,13 @@
+@@ -3505,9 +3522,13 @@ def _run_single_child(
              )
          # _attach_worktree defaults to a no-op when isolation never engaged.
          _attach_worktree(_error_entry)
 +        from agent.braia_routing import publish_child_evidence
 +        publish_child_evidence(child, parent_agent, _error_entry)
          return _error_entry
- 
+
      finally:
 +        from agent.braia_routing import finish_child
 +        finish_child(child, parent_agent)
          # Stop the heartbeat thread so it doesn't keep touching parent activity
          # after the child has finished (or failed).  Guard the join: .start()
          # now lives inside the try block, so if it raised (OS thread
-@@ -3851,6 +3872,12 @@
+@@ -3851,6 +3872,12 @@ def delegate_task(
      # They never spawn, so they bypass the pause gate, depth limit, and the
      # async dispatch machinery entirely.
      normalized_action = (action or "").strip().lower()
@@ -129,7 +282,7 @@
      if normalized_action in _CONTROL_ACTIONS:
          return _handle_control_action(
              normalized_action, subagent_id, message, parent_agent
-@@ -3922,8 +3949,10 @@
+@@ -3922,8 +3949,10 @@ def delegate_task(
      # uses it to route its reviewer subagent onto ``auxiliary.review``
      # without touching the global delegation pin.
      try:
@@ -141,10 +294,10 @@
          )
      except ValueError as exc:
          return tool_error(str(exc))
-@@ -4004,6 +4033,18 @@
+@@ -4004,6 +4033,18 @@ def delegate_task(
              return tool_error(f"Task {i} output_schema invalid: {schema_err}")
          task_schemas.append(coerced_schema)
- 
+
 +    task_routes = [None] * len(task_list)
 +    task_credentials = [creds] * len(task_list)
 +    if routing_policy:
@@ -159,8 +312,8 @@
 +
      overall_start = time.monotonic()
      results = []
- 
-@@ -4054,6 +4095,7 @@
+
+@@ -4054,6 +4095,7 @@ def delegate_task(
      # subagent-lifecycle API).
      children = []
      for i, t in enumerate(task_list):
@@ -168,7 +321,7 @@
          # Per-task role beats top-level; normalise again so unknown
          # per-task values warn and degrade to leaf uniformly.
          effective_role = _normalize_role(t.get("role") or top_role)
-@@ -4086,8 +4128,23 @@
+@@ -4086,8 +4128,23 @@ def delegate_task(
                  override_acp_command=creds.get("command"),
                  override_acp_args=creds.get("args"),
                  role=effective_role,
@@ -193,10 +346,10 @@
              # Explicit-pin preflight failures (e.g. pinned delegation.command
              # missing from PATH) refuse the spawn loudly (#80450).
              return tool_error(str(exc))
-@@ -5079,10 +5136,27 @@
+@@ -5079,10 +5136,27 @@ def _build_dynamic_schema_overrides() -> dict:
      }
      overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
- 
+
 -    return {
 -        "description": _build_top_level_description(),
 -        "parameters": overrides_params,
@@ -222,145 +375,14 @@
 +    if policy:
 +        description += " Braia routing enabled: every task requires model/effort/type/complexity/justification/acceptance_id in routing; active-parent family overrides legacy delegation pins."
 +    return {"description": description, "parameters": overrides_params}
- 
- 
+
+
  DELEGATE_TASK_SCHEMA = {
---- a/hermes_cli/config_defaults.py
-+++ b/hermes_cli/config_defaults.py
-@@ -2087,7 +2087,9 @@
-     # so child agents can run on a different (cheaper/faster) provider and model.
-     # Uses the same runtime provider resolution as CLI/gateway startup, so all
-     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
-+    "braia_routing": {"enabled": False},
-     "delegation": {
-+        "fallback_providers": None,  # legacy explicit child fallback chain
-         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
-         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
-         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
---- a/run_agent.py
-+++ b/run_agent.py
-@@ -917,7 +917,7 @@
-     ):
-         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
-         from agent.agent_runtime_helpers import switch_model
--        return switch_model(
-+        switched = switch_model(
-             self,
-             new_model,
-             new_provider,
-@@ -926,6 +926,10 @@
-             api_mode,
-             capabilities,
-         )
-+        if (switched is not False and self.provider == new_provider and self.model == new_model
-+                and not getattr(self, "_braia_automatic_switch", False)):
-+            self._braia_manual_route = (new_provider, new_model)
-+        return switched
- 
-     def _safe_print(self, *args, **kwargs):
-         """Print that silently handles broken pipes / closed stdout.
-@@ -7112,6 +7116,10 @@
- 
-     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
-         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
-+        from agent.braia_routing import route_fallback
-+        routed = route_fallback(self, reason)
-+        if routed is not None:
-+            return routed
-         from agent.chat_completion_helpers import try_activate_fallback
-         return try_activate_fallback(self, reason)
- 
-@@ -7123,6 +7131,9 @@
-         fallback chain configured).  Mirrors the early-return guard in
-         ``try_activate_fallback`` (#35314, #17446).
-         """
-+        state = getattr(self, "_braia_execution", None)
-+        if state is not None:
-+            return bool(state["alternatives"])
-         chain = getattr(self, "_fallback_chain", None) or []
-         index = getattr(self, "_fallback_index", 0)
-         return index < len(chain)
-@@ -8530,6 +8541,7 @@
-         while side-effect ordering is preserved.
-         """
-         tool_calls = assistant_message.tool_calls
-+        self._braia_route_batch_safe = len(tool_calls) == 1
- 
-         # Allow _vprint during tool execution even with stream consumers
-         self._executing_tools = True
-@@ -8561,6 +8573,7 @@
-             )
-         finally:
-             self._executing_tools = False
-+            self._braia_route_batch_safe = False
- 
-     def _dispatch_delegate_task(self, function_args: dict) -> str:
-         """Single call site for delegate_task dispatch.
-@@ -8687,6 +8700,9 @@
-                 logger.debug("Conversation root lineage walk failed", exc_info=True)
-         return start
- 
-+    from agent.braia_routing import routed_conversation as _braia_routed_conversation
-+
-+    @_braia_routed_conversation
-     def run_conversation(
-         self,
-         user_message: Any,
---- a/agent/conversation_loop.py
-+++ b/agent/conversation_loop.py
-@@ -3513,7 +3513,7 @@
-                     # Eager fallback: empty/malformed responses are a common
-                     # rate-limit symptom.  Switch to fallback immediately
-                     # rather than retrying with extended backoff.
--                    if agent._fallback_index < len(agent._fallback_chain):
-+                    if agent._has_pending_fallback():
-                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                     if agent._try_activate_fallback():
-                         active_system_prompt = _sync_failover_system_message(
-@@ -3981,7 +3981,7 @@
-                         )
-                         if (
-                             _cf_terminated
--                            and agent._fallback_index < len(agent._fallback_chain)
-+                            and agent._has_pending_fallback()
-                         ):
-                             agent._vprint(
-                                 f"{agent.log_prefix}🛡️  Content filter terminated "
-@@ -5593,7 +5593,12 @@
-                     (is_rate_limited and _wrapped_output_cap_budget is None)
-                     or (_is_transport_failure and retry_count >= 2)
-                 )
--                if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
-+                _braia_unavailable_model = (
-+                    getattr(agent, "_braia_execution", None) is not None
-+                    and classified.reason.value in {"model_not_found", "server_error"}
-+                )
-+                _should_fallback = _should_fallback or _braia_unavailable_model
-+                if _should_fallback and agent._has_pending_fallback():
-                     # Don't eagerly fallback if credential pool rotation may
-                     # still recover.  See _pool_may_recover_from_rate_limit
-                     # for the single-credential-pool exception.  Fixes #11314.
-@@ -5604,7 +5609,7 @@
-                     # different model regardless of pool state.
-                     _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
-                     pool_may_recover = (
--                        False if _is_upstream
-+                        False if (_is_upstream or _braia_unavailable_model)
-                         else _ra()._pool_may_recover_from_rate_limit(
-                             agent._credential_pool,
-                         )
-@@ -5663,7 +5668,7 @@
-                 if (
-                     classified.is_auth
-                     and not _retry.auth_failover_attempted
--                    and agent._fallback_index < len(agent._fallback_chain)
-+                    and agent._has_pending_fallback()
-                 ):
-                     _retry.auth_failover_attempted = True
-                     agent._buffer_status(
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 4ef3177fb3..c9e950ac0e 100644
 --- a/tools/process_registry.py
 +++ b/tools/process_registry.py
-@@ -3155,6 +3155,8 @@
+@@ -3155,6 +3155,8 @@ def _format_async_delegation(evt: dict) -> str:
                  header += ", TRUNCATED: hit max_iterations — work may be incomplete"
              header += ") ---"
              lines.append(header)
@@ -369,7 +391,7 @@
              if r_status in ("completed", "success") and r_summary:
                  if r_truncated:
                      lines.append(
-@@ -3207,6 +3209,8 @@
+@@ -3207,6 +3209,8 @@ def _format_async_delegation(evt: dict) -> str:
          lines.extend(_notice)
      _trunc = " [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""
      lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s{_trunc}")
@@ -378,19 +400,12 @@
      lines.append("--- RESULT ---")
      if status in ("completed", "success") and summary:
          if truncated:
---- a/tools/async_delegation.py
-+++ b/tools/async_delegation.py
-@@ -992,6 +992,7 @@
-         "dispatched_at": dispatched_at,
-         "completed_at": completed_at,
-         "exit_reason": result.get("exit_reason"),
-+        "braia_routing": result.get("braia_routing"),
-     }
-     # Routing origin captured at dispatch (see _capture_routing_origin):
-     # additive, lets the gateway reconstruct a full SessionSource (incl.
+diff --git a/agent/braia_routing.py b/agent/braia_routing.py
+new file mode 100644
+index 0000000000..b8566fe0a7
 --- /dev/null
 +++ b/agent/braia_routing.py
-@@ -0,0 +1,802 @@
+@@ -0,0 +1,841 @@
 +"""Braia task routing. Local policy/catalog; no prompts or credentials in state.
 +
 +The verifier API is trusted host integration, deliberately NOT a model tool.
@@ -620,7 +635,20 @@
 +    if complexity not in TIERS:
 +        raise ValueError("Braia complexity must be routine/normal/complex/exceptional")
 +    return _digest([task_type, complexity, acceptance, context.get("_role", "worker"),
-+                    bool(context.get("_continuation", False)), cfg["policy_version"], cfg["providers"]])
++                    bool(context.get("_continuation", False)), context.get("model"),
++                    context.get("effort") if "effort" in context else None,
++                    cfg["policy_version"], cfg["providers"]])
++
++
++def task_key(context, cfg):
++    normalized = {k: v for k, v in context.items() if k not in {"model", "effort", "justification"}}
++    return context_key(normalized, cfg)
++
++
++def effective_effort(spec, explicit=None):
++    if explicit is not None and explicit not in spec.get("efforts", []):
++        raise ValueError("Braia effort unsupported by selected model")
++    return explicit if explicit is not None else spec.get("default_effort")
 +
 +
 +def validate_task(task, provider, cfg):
@@ -655,7 +683,7 @@
 +    return parsed
 +
 +
-+def fallback_candidates(cfg, provider, model, complexity, orchestrator=False):
++def fallback_candidates(cfg, provider, model, complexity, orchestrator=False, effort=None):
 +    if not cfg["fallback"]["enabled"] or cfg["fallback"]["max_attempts"] < 2:
 +        return []
 +    spec = cfg["providers"].get(provider, {}).get("models", {}).get(model)
@@ -672,7 +700,8 @@
 +            continue
 +        choices = [(TIERS[spec["tier"]], name) for name, spec in entry["models"].items()
 +                   if TIERS[spec["tier"]] >= required and spec.get("availability") != "unavailable"
-+                   and (not orchestrator or name == entry["orchestrator_model"])]
++                   and (not orchestrator or name == entry["orchestrator_model"])
++                   and (effort is None or effort in spec.get("efforts", []))]
 +        if choices:
 +            result.append({"provider": other, "model": min(choices)[1]})
 +    return result[:cfg["fallback"]["max_attempts"] - 1]
@@ -692,13 +721,17 @@
 +        except FileExistsError:
 +            pass
 +        with self.tx() as db:
-+            db.execute("CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, bucket TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, created REAL NOT NULL, finished REAL, latency REAL, status TEXT, verdict TEXT, evidence TEXT, verifier TEXT, rework INTEGER DEFAULT 0, usage REAL)")
++            db.execute("CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, bucket TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, created REAL NOT NULL, finished REAL, latency REAL, status TEXT, verdict TEXT, evidence TEXT, verifier TEXT, rework INTEGER DEFAULT 0, usage REAL, tier TEXT, effort TEXT)")
 +            # Additive migration under BEGIN IMMEDIATE, safe across processes.
 +            # Legacy IDs deliberately remain unowned: never backfill from a
 +            # review request or from model-visible transcripts.
 +            columns = {row[1] for row in db.execute("PRAGMA table_info(executions)")}
 +            if "owner" not in columns:
 +                db.execute("ALTER TABLE executions ADD COLUMN owner TEXT")
++            if "tier" not in columns:
++                db.execute("ALTER TABLE executions ADD COLUMN tier TEXT")
++            if "effort" not in columns:
++                db.execute("ALTER TABLE executions ADD COLUMN effort TEXT")
 +            db.execute("CREATE INDEX IF NOT EXISTS bucket_time ON executions(bucket, created)")
 +            db.execute("CREATE TABLE IF NOT EXISTS priorities (bucket TEXT PRIMARY KEY, provider TEXT NOT NULL, changed REAL NOT NULL, reason TEXT NOT NULL)")
 +            db.execute("CREATE TABLE IF NOT EXISTS promotions (id INTEGER PRIMARY KEY, bucket TEXT, previous TEXT, provider TEXT, created REAL, reason TEXT)")
@@ -719,13 +752,15 @@
 +            db.close()
 +
 +    def begin(self, cfg, context, provider, model, now=None, *, owner=None):
-+        if model not in cfg["providers"].get(provider, {}).get("models", {}):
++        spec = cfg["providers"].get(provider, {}).get("models", {}).get(model)
++        if spec is None:
 +            raise ValueError("Braia execution not in authorized catalog")
++        effort = effective_effort(spec, context.get("effort"))
 +        now = time.time() if now is None else now
 +        execution_id = uuid.uuid4().hex
 +        with self.tx() as db:
-+            db.execute("INSERT INTO executions(id,bucket,provider,model,created,owner) VALUES(?,?,?,?,?,?)",
-+                       (execution_id, context_key(context, cfg), provider, model, now, owner))
++            db.execute("INSERT INTO executions(id,bucket,provider,model,created,owner,tier,effort) VALUES(?,?,?,?,?,?,?,?)",
++                       (execution_id, task_key(context, cfg), provider, model, now, owner, spec["tier"], effort))
 +            # Bounded retention. Reviewers must submit evidence before expiry.
 +            db.execute("DELETE FROM executions WHERE created < ?", (now - cfg["learning"]["window_days"] * 86400,))
 +            db.execute("DELETE FROM executions WHERE id IN (SELECT id FROM executions ORDER BY created DESC LIMIT -1 OFFSET 10000)")
@@ -771,7 +806,7 @@
 +        learning = cfg["learning"]
 +        if not learning["enabled"]:
 +            return initial, "initial_learning_disabled"
-+        bucket = context_key(context, cfg)
++        bucket = task_key(context, cfg)
 +        with self.tx() as db:
 +            prior = db.execute("SELECT * FROM priorities WHERE bucket=?", (bucket,)).fetchone()
 +            current = prior["provider"] if prior else initial
@@ -784,8 +819,22 @@
 +            # Each sustained window uses NEW, disjoint samples per candidate.
 +            # Polling the same evidence cannot increase the support count.
 +            n, windows = learning["min_samples"], learning["sustained_windows"]
++            def comparable(provider):
++                entry = cfg["providers"][provider]
++                choices = [(name, spec) for name, spec in entry["models"].items()
++                           if spec["tier"] == context["complexity"] and spec.get("availability") != "unavailable"]
++                if not choices:
++                    return None
++                model, spec = min(choices)
++                return model, spec["tier"], effective_effort(spec)
++            signatures = {provider: comparable(provider) for provider in cfg["providers"]}
 +            def stats(provider):
++                signature = signatures.get(provider)
++                if signature is None:
++                    return None
++                model, tier, effort = signature
 +                data = [r for r in rows if r["provider"] == provider
++                        and r["model"] == model and r["tier"] == tier and r["effort"] == effort
 +                        and (r["verdict"] is not None or r["status"] in PROVIDER_ERRORS)]
 +                reviewed = [r for r in data if r["verdict"] is not None]
 +                if len(reviewed) < n * windows:
@@ -817,6 +866,8 @@
 +                            and (old[4]-new[4])/old[4] >= margin))
 +            for candidate in sorted(available):
 +                if candidate == current or candidate not in cfg["providers"]:
++                    continue
++                if signatures.get(candidate) is None or signatures[candidate][1:] != signatures[current][1:]:
 +                    continue
 +                challenger = stats(candidate)
 +                if challenger is not None and all(better(new, old) for new, old in zip(challenger, incumbent)):
@@ -874,8 +925,8 @@
 +    return cfg.get("initial_model") if provider == cfg["initial_provider"] else cfg.get("manual_model")
 +
 +
-+def _start_choice(cfg, provider, model, complexity, orchestrator):
-+    alternatives = fallback_candidates(cfg, provider, model, complexity, orchestrator)
++def _start_choice(cfg, provider, model, complexity, orchestrator, effort=None):
++    alternatives = fallback_candidates(cfg, provider, model, complexity, orchestrator, effort)
 +    spec = cfg["providers"].get(provider, {}).get("models", {}).get(model)
 +    if spec is None or spec.get("availability") == "unavailable":
 +        if not alternatives:
@@ -900,7 +951,9 @@
 +        return False
 +    candidate = state["alternatives"].pop(0)
 +    try:
-+        _switch(agent, candidate["provider"], candidate["model"], state["cfg"], state["profile"])
++        target = state["cfg"]["providers"][candidate["provider"]]["models"][candidate["model"]]
++        effort = effective_effort(target, state["context"].get("effort"))
++        _switch(agent, candidate["provider"], candidate["model"], state["cfg"], state["profile"], effort)
 +    except Exception:
 +        return False  # bounded, sanitized; credentials never enter history
 +    # A fallback may benefit from work already done by the first provider.
@@ -980,7 +1033,8 @@
 +                            pass
 +                    provider, decision = (store.choose(cfg, context, available) if classified else (cfg["initial_provider"], "initial_unclassified"))
 +                    model = _orchestrator_model(cfg, provider)
-+            provider, model, alternatives, disconnected = _start_choice(cfg, provider, model, context["complexity"], not child)
++            requested_effort = context.get("effort") if child else None
++            provider, model, alternatives, disconnected = _start_choice(cfg, provider, model, context["complexity"], not child, requested_effort)
 +            if disconnected:
 +                decision = "availability_fallback"
 +            if (provider, model) != (agent.provider, agent.model) or (not child and not inflight):
@@ -990,7 +1044,7 @@
 +                    if not alternatives:
 +                        raise ValueError("Braia preferred provider unavailable; no capable fallback") from None
 +                    candidate = alternatives.pop(0)
-+                    _switch(agent, candidate["provider"], candidate["model"], cfg, profile)
++                    _switch(agent, candidate["provider"], candidate["model"], cfg, profile, requested_effort)
 +                    decision = "availability_fallback"
 +            agent._braia_last_route = (agent.provider, agent.model)
 +            agent._fallback_chain = []  # prevent native unbounded/wrong-capacity chain

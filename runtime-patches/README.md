@@ -57,7 +57,9 @@ suporte a esforço usa effort null e não recebe esforço herdado.
 
 Learning defaults experimentais: min_samples 8, sustained_windows 2, window_days
 30, promotion_margin 0.15, cooldown_seconds 86400. Exigem **16 veredictos por
-provedor**, em grupos distintos; não estão homologados. Qualidade/confiabilidade
+provedor**, em grupos distintos e com o modelo, tier e esforço efetivo
+comparáveis. Evidência de outro modelo/tier/esforço é isolada e não promove.
+Esses parâmetros não estão homologados. Qualidade/confiabilidade
 não caem para comprar latência; retrabalho não aumenta. Compare rotina,
 complexidade, critério, versão e catálogo; sem suporte suficiente mantém ordem.
 Desligar aprendizado restaura a preferência inicial.
@@ -77,6 +79,13 @@ Fallback limita inicial + uma alternativa de capacidade equivalente/superior.
 Continua a chamada com histórico; não reexecuta a tarefa inteira. Retries nativos
 finitos por provedor permanecem. Cota, auth, timeout, sobrecarga, servidor e modelo
 indisponível são disponibilidade. Qualidade/política/formato não acionam troca.
+Esforço explícito é mantido na alternativa; candidato incompatível é excluído e,
+sem opção restante, a troca falha fechada.
+
+Este patch diverge deliberadamente do artefato genérico da fonte v1.0.11: a
+especialização contábil corrige isolamento adaptativo por capacidade/esforço e
+preservação de esforço no fallback. O hash publicado deste patch deve, portanto,
+ser próprio deste repositório e não byte-idêntico ao da distribuição pericial.
 
 ## Limites e validação
 

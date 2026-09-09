@@ -85,6 +85,16 @@ def test_unavailable_catalog_entry_not_selected(cfg, context):
     assert br.fallback_candidates(cfg, "anthropic", "claude-large", "complex") == []
 
 
+def test_fallback_preserves_explicit_effort_or_fails_closed(cfg):
+    assert br.fallback_candidates(cfg, "anthropic", "claude-normal", "normal", effort="high") == [
+        {"provider": "openai-codex", "model": "gpt-normal"}
+    ]
+    for spec in cfg["providers"]["openai-codex"]["models"].values():
+        spec["efforts"] = ["low"]
+        spec["default_effort"] = "low"
+    assert br.fallback_candidates(cfg, "anthropic", "claude-normal", "normal", effort="high") == []
+
+
 def test_text_completion_is_not_quality(cfg, context, tmp_path):
     s = br.Store(tmp_path)
     for p in cfg["providers"]:
@@ -126,6 +136,20 @@ def test_noncomparable_or_stale_evidence_does_not_promote(cfg, context, tmp_path
     if change == "model": cfg["providers"]["anthropic"]["models"]["claude-normal"]["revision"] = "new"
     if change == "disconnected": available = ["anthropic"]
     assert s.choose(cfg, context, available)[0] == "anthropic"
+
+
+def test_model_tier_and_effect_are_separate_and_not_cross_promoted(cfg, context, tmp_path):
+    assert br.context_key({**context, "model": "claude-normal", "effort": "medium"}, cfg) != \
+           br.context_key({**context, "model": "claude-large", "effort": "high"}, cfg)
+    s = br.Store(tmp_path)
+    now = time.time()
+    for n in range(4):
+        sample(s, cfg, context, "anthropic", False, now-20+n)
+        explicit = {**context, "model": "gpt-normal", "effort": "high"}
+        eid = s.begin(cfg, explicit, "openai-codex", "gpt-normal", now-20+n)
+        s.finish(eid, "completed", 1)
+        s.verdict(eid, "accepted", "a"*64, "test-suite")
+    assert s.choose(cfg, context, list(cfg["providers"]), now)[0] == "anthropic"
 
 
 def test_quality_beats_latency(cfg, context, tmp_path):
@@ -508,6 +532,20 @@ def test_fallback_bounded_no_task_or_tool_replay(cfg, context, tmp_path):
         assert br.route_fallback(a, "timeout") is False
         assert sw.call_count == 1
     assert len(a._braia_execution["ids"]) == 2
+
+
+def test_fallback_switch_receives_explicit_effort(cfg, context, tmp_path):
+    a = agent(tmp_path)
+    s = br.Store(tmp_path)
+    explicit = {**context, "model": "claude-normal", "effort": "high"}
+    eid = s.begin(cfg, explicit, "anthropic", "claude-normal")
+    a._braia_execution = {"id": eid, "ids": [eid], "cfg": cfg, "context": explicit,
+                          "profile": tmp_path, "store": s, "started": time.monotonic(),
+                          "alternatives": br.fallback_candidates(
+                              cfg, "anthropic", "claude-normal", "normal", effort="high")}
+    with patch.object(br, "_switch", side_effect=switch) as sw:
+        assert br.route_fallback(a, "rate_limit") is True
+    assert sw.call_args.args[-1] == "high"
 
 
 def test_conversation_hook_records_unreviewed_and_blocks_overlap(cfg, context, tmp_path):

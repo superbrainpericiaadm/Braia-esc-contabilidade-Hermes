@@ -100,7 +100,8 @@ de entrega. Não copiar contas de outras instalações.
 O runtime precisa das extensões de `runtime-patches/README.md`; o configurador
 recusa uma interface incompatível. A arquitetura da v1.0.11 foi validada no
 laboratório, incluindo delegação real, conclusão assíncrona e revisão
-persistida. Veja `docs/RELEASE-v1.0.11.md`. A atualização exige validação em cada
-instalação; a publicação não inicia o lote de clientes. O Worker de novas
+persistida. Os limites, fluxo e critérios operacionais estão descritos de forma
+autocontida neste documento e em `runtime-patches/README.md`. A atualização exige
+validação em cada instalação; a publicação não inicia o lote de clientes. O Worker de novas
 instalações pertence a uma etapa separada.
 Não empacotar dados, endereços, backups, histórico ou credenciais de instalação.

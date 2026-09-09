@@ -1,5 +1,8 @@
 import hashlib
+import os
 from pathlib import Path
+import pwd
+import grp
 import subprocess
 
 import yaml
@@ -62,6 +65,51 @@ def test_installer_pins_reviewed_runtime_and_installs_extension():
     assert "CODEX_ONLY" not in install + configure
 
 
+def test_existing_marker_update_preserves_local_state_and_adds_operational_artifacts(tmp_path):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    backup = tmp_path / "backup"
+    home.mkdir(); workspace.mkdir()
+    (home / ".contadoria-kit-installed").write_text("existing\n")
+    preserved = {
+        ".env": "TELEGRAM_BOT_TOKEN=local-secret\n",
+        "config.yaml": "model: {default: local-model}\n",
+        "SOUL.md": "identidade local\n",
+        "AGENTS.md": "orquestração local\n",
+    }
+    for name, value in preserved.items():
+        (home / name).write_text(value)
+    (home / "scripts").mkdir()
+    (home / "scripts/configure_multi_ai.py").write_text("old configurator\n")
+    user = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    command = '. "$HELPER"; install_kit_artifacts "$SOURCE" "$HOME_DIR" "$OWNER" "$GROUP" "$BACKUP" "$WORKSPACE"'
+    env = {**os.environ, "HELPER": str(ROOT / "scripts/install_kit_artifacts.sh"),
+           "SOURCE": str(ROOT), "HOME_DIR": str(home), "OWNER": user, "GROUP": group,
+           "BACKUP": str(backup), "WORKSPACE": str(workspace)}
+    subprocess.run(["bash", "-c", command], check=True, env=env)
+    for name, value in preserved.items():
+        assert (home / name).read_text() == value
+    assert (home / "scripts/configure_multi_ai.py").read_bytes() == (ROOT / "scripts/configure_multi_ai.py").read_bytes()
+    assert (home / "skills/braia-claude-login/SKILL.md").is_file()
+    assert any(path.name == "configure_multi_ai.py" for path in backup.rglob("configure_multi_ai.py"))
+
+
+def test_existing_install_is_validated_before_mutation_and_coordinates_service():
+    install = (ROOT / "install.sh").read_text(encoding="utf-8")
+    preflight = install.index('--check >/dev/null')
+    assert preflight < install.index("apt-get update")
+    assert preflight < install.index("bash \"${INSTALLER_TMP}\"")
+    assert install.index("systemctl stop hermes-contadoria.service") < install.index("bash \"${INSTALLER_TMP}\"")
+    assert "SERVICE_WAS_ACTIVE" in install and "systemctl start hermes-contadoria.service" in install
+
+
+def test_fallback_documentation_is_self_contained():
+    policy = (ROOT / "POLITICA-FALLBACK.md").read_text(encoding="utf-8")
+    assert "docs/RELEASE-v1.0.11.md" not in policy
+    assert "runtime-patches/README.md" in policy
+
+
 def test_shell_scripts_parse():
-    for path in (ROOT / "install.sh", ROOT / "configure.sh", ROOT / "bootstrap.sh", ROOT / "scripts/check-no-secrets.sh"):
+    for path in (ROOT / "install.sh", ROOT / "configure.sh", ROOT / "bootstrap.sh", ROOT / "scripts/check-no-secrets.sh", ROOT / "scripts/install_kit_artifacts.sh"):
         subprocess.run(["bash", "-n", str(path)], check=True)
