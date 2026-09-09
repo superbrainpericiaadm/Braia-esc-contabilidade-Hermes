@@ -91,6 +91,16 @@ printf '\n>> Abrindo o assistente oficial do Hermes para escolher e autenticar o
     "${RUNTIME_DIR}/venv/bin/python" -m hermes_cli.main setup < /dev/tty
 )
 
+printf '\n>> Configurando rotas conforme as assinaturas conectadas...\n'
+sudo -u "${SERVICE_USER}" -H env \
+  HOME="${SERVICE_HOME}" \
+  USER="${SERVICE_USER}" \
+  LOGNAME="${SERVICE_USER}" \
+  HERMES_HOME="${HERMES_HOME}" \
+  VIRTUAL_ENV="${RUNTIME_DIR}/venv" \
+  PATH="${RUNTIME_DIR}/venv/bin:${RUNTIME_DIR}/node_modules/.bin:/usr/local/bin:/usr/bin:/bin" \
+  "${RUNTIME_DIR}/venv/bin/python" "${HERMES_HOME}/scripts/configure_multi_ai.py"
+
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
 

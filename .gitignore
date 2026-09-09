@@ -13,6 +13,9 @@ cache/
 *.log
 *.pid
 *.lock
+.venv/
+__pycache__/
+*.py[cod]
 .DS_Store
 .idea/
 .vscode/

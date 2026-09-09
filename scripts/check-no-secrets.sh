@@ -6,12 +6,12 @@ cd "${ROOT_DIR}"
 
 failed=false
 
-if find . -type d \( -name skills -o -name memories -o -name sessions -o -name credentials -o -name secrets \) -print -quit | grep -q .; then
-  printf 'ERRO: diretório proibido encontrado no pacote público.\n' >&2
+if git ls-files -co --exclude-standard | grep -Eq '(^|/)(memories|sessions|credentials|secrets)/'; then
+  printf 'ERRO: diretório de estado ou credencial encontrado no pacote público.\n' >&2
   failed=true
 fi
 
-if find . -type f \( -name auth.json -o -name '*.db' -o -name '*.db-*' -o -name '*.pem' -o -name '*.key' \) -print -quit | grep -q .; then
+if git ls-files -co --exclude-standard | grep -Eq '(^|/)(auth\.json|[^/]+\.db(-[^/]*)?|[^/]+\.(pem|key))$'; then
   printf 'ERRO: arquivo sensível/estado proibido encontrado no pacote público.\n' >&2
   failed=true
 fi
@@ -34,4 +34,4 @@ if [[ "${failed}" == true ]]; then
   exit 1
 fi
 
-printf 'OK: nenhum diretório de skills/estado nem padrão conhecido de segredo foi encontrado.\n'
+printf 'OK: nenhum estado privado, credencial ou padrão conhecido de segredo foi encontrado.\n'

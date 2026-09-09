@@ -11,7 +11,7 @@ readonly WORKSPACE_DIR="${SERVICE_HOME}/workspace"
 readonly RUNTIME_DIR="/opt/hermes-contadoria-runtime"
 readonly KIT_MARKER="${HERMES_HOME}/.contadoria-kit-installed"
 readonly KIT_IN_PROGRESS_MARKER="${HERMES_HOME}/.contadoria-kit-installing"
-readonly HERMES_COMMIT="${HERMES_COMMIT:-03fa32c92dd445eb64c7f67434dd91b32c40701d}"
+readonly HERMES_COMMIT="${HERMES_COMMIT:-29112bef099274229cadff79cdff7bf7b99c4b77}"
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER_TMP=""
@@ -43,6 +43,12 @@ for required in \
   "${SOURCE_DIR}/templates/config.yaml" \
   "${SOURCE_DIR}/templates/profile.yaml" \
   "${SOURCE_DIR}/templates/hermes-contadoria.service.tpl" \
+  "${SOURCE_DIR}/AGENTS.md" \
+  "${SOURCE_DIR}/scripts/apply_runtime_patch.py" \
+  "${SOURCE_DIR}/scripts/configure_multi_ai.py" \
+  "${SOURCE_DIR}/runtime-patches/delegation-fallback.patch" \
+  "${SOURCE_DIR}/runtime-patches/previous-delegation-fallback.patch" \
+  "${SOURCE_DIR}/skills/braia-claude-login/SKILL.md" \
   "${SOURCE_DIR}/.env.example"; do
   [[ -f "${required}" ]] || fail "arquivo obrigatório ausente: ${required}"
 done
@@ -90,7 +96,7 @@ curl --fail --silent --show-error --location \
 
 grep -q -- '--no-skills' "${INSTALLER_TMP}" || fail "o instalador oficial baixado não oferece --no-skills"
 
-printf '>> Instalando Hermes sem skills...\n'
+printf '>> Instalando Hermes sem o catálogo público de skills...\n'
 HERMES_HOME="${HERMES_HOME}" HERMES_INSTALL_DIR="${RUNTIME_DIR}" \
   bash "${INSTALLER_TMP}" \
     --dir "${RUNTIME_DIR}" \
@@ -100,6 +106,13 @@ HERMES_HOME="${HERMES_HOME}" HERMES_INSTALL_DIR="${RUNTIME_DIR}" \
     --no-skills \
     --skip-setup \
     --non-interactive
+
+printf '>> Aplicando extensão revisada de roteamento por tarefa...\n'
+install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
+  "${HERMES_HOME}/backups/runtime"
+"${RUNTIME_DIR}/venv/bin/python" "${SOURCE_DIR}/scripts/apply_runtime_patch.py" \
+  --runtime "${RUNTIME_DIR}" \
+  --backup-root "${HERMES_HOME}/backups/runtime"
 
 # O instalador roda como root. Torna o checkout/venv executável pelo grupo
 # isolado do serviço sem abrir o runtime para outros usuários do sistema.
@@ -128,12 +141,25 @@ if [[ "${first_kit_install}" == true ]]; then
     "${SOURCE_DIR}/templates/SOUL.md" "${HERMES_HOME}/SOUL.md"
   install -m 0644 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
     "${SOURCE_DIR}/templates/profile.yaml" "${HERMES_HOME}/profile.yaml"
+  install -m 0644 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
+    "${SOURCE_DIR}/AGENTS.md" "${HERMES_HOME}/AGENTS.md"
 
   install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
-    "${HERMES_HOME}/agents" "${HERMES_HOME}/skills"
+    "${HERMES_HOME}/agents" "${HERMES_HOME}/skills" "${HERMES_HOME}/scripts"
   find "${SOURCE_DIR}/agents" -maxdepth 1 -type f -name '*.md' -print0 | \
     xargs -0 -I{} install -m 0644 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
       "{}" "${HERMES_HOME}/agents/"
+
+  install -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
+    "${SOURCE_DIR}/scripts/configure_multi_ai.py" "${HERMES_HOME}/scripts/configure_multi_ai.py"
+  install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
+    "${HERMES_HOME}/skills/braia-claude-login/scripts"
+  install -m 0644 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
+    "${SOURCE_DIR}/skills/braia-claude-login/SKILL.md" \
+    "${HERMES_HOME}/skills/braia-claude-login/SKILL.md"
+  install -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
+    "${SOURCE_DIR}/skills/braia-claude-login/scripts/claude_login.py" \
+    "${HERMES_HOME}/skills/braia-claude-login/scripts/claude_login.py"
 
   printf '%s\n' \
     "Comunidade ContadorIA kit" \
@@ -148,8 +174,8 @@ fi
 [[ -f "${HERMES_HOME}/.no-bundled-skills" ]] || \
   fail "o marcador .no-bundled-skills não foi criado"
 
-skill_item="$(find "${HERMES_HOME}/skills" -mindepth 1 -print -quit 2>/dev/null || true)"
-[[ -z "${skill_item}" ]] || fail "a instalação deveria estar sem skills, mas encontrou: ${skill_item}"
+[[ -f "${HERMES_HOME}/skills/braia-claude-login/SKILL.md" ]] || \
+  fail "skill operacional de login Claude não foi instalada"
 
 install -m 0644 "${SOURCE_DIR}/templates/hermes-contadoria.service.tpl" \
   /etc/systemd/system/hermes-contadoria.service
