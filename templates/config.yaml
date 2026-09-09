@@ -1,14 +1,48 @@
-agent:
-  max_turns: 80
-  verbose: false
-  reasoning_effort: high
-
+_config_version: 33
+model:
+  default: gpt-5.6-sol
+  provider: openai-codex
+  aliases:
+    gpt-5.6-luna: openai-codex/gpt-5.6-luna
+    gpt-5.6-terra: openai-codex/gpt-5.6-terra
+    gpt-5.6-sol: openai-codex/gpt-5.6-sol
+    gpt-6-astra: openai-codex/gpt-6-astra
+approvals:
+  mode: 'off'
+  timeout: 60
+  cron_mode: approve
+  destructive_slash_confirm: false
+  mcp_reload_confirm: false
+  deny:
+    - sudo*
+delegation:
+  subagent_auto_approve: true
+  max_concurrent_children: 3
+  max_spawn_depth: 1
+  child_timeout_seconds: 0
 terminal:
   backend: local
-  cwd: "__WORKSPACE__"
+  cwd: __WORKSPACE__
   timeout: 180
   home_mode: true
-
+timezone: America/Sao_Paulo
+display:
+  busy_input_mode: queue
+  busy_text_mode: queue
+  compact: true
+  show_reasoning: false
+  memory_notifications: false
+  streaming: true
+stt:
+  enabled: true
+  provider: local
+  language: pt
+  echo_transcripts: false
+  prompt: Português brasileiro (pt-BR). Preserve nomes próprios, números e termos técnicos.
+  local:
+    model: base
+tts:
+  provider: edge
 memory:
   memory_enabled: true
   user_profile_enabled: true
@@ -16,28 +50,53 @@ memory:
   user_char_limit: 8000
   nudge_interval: 10
   flush_min_turns: 3
-
-delegation:
-  max_iterations: 40
-
+platform_toolsets:
+  telegram: [file, terminal, web, skills, memory, session_search, delegation, todo, cronjob, tts, clarify]
+  cli: [file, terminal, web, skills, memory, session_search, delegation, todo, cronjob, tts, clarify]
 skills:
+  write_approval: false
+  guard_agent_created: false
   external_dirs: []
   creation_nudge_interval: 0
-
+model_aliases:
+  gpt-5.6-luna: {provider: openai-codex, model: gpt-5.6-luna}
+  gpt-5.6-terra: {provider: openai-codex, model: gpt-5.6-terra}
+  gpt-5.6-sol: {provider: openai-codex, model: gpt-5.6-sol}
+  gpt-6-astra: {provider: openai-codex, model: gpt-6-astra}
+auxiliary: {}
+braia_routing:
+  enabled: true
+  initialized: false
+  schema_version: 1
+  initial_provider: openai-codex
+  initial_model: gpt-5.6-sol
+  initial_tier: complex
+  providers:
+    openai-codex:
+      models:
+        gpt-5.6-luna: {tier: routine, efforts: [low, medium, high], default_effort: medium, availability: unverified, source: reviewed_policy}
+        gpt-5.6-terra: {tier: normal, efforts: [low, medium, high], default_effort: medium, availability: unverified, source: reviewed_policy}
+        gpt-5.6-sol: {tier: complex, efforts: [low, medium, high], default_effort: medium, availability: unverified, source: reviewed_policy}
+        gpt-6-astra: {tier: exceptional, efforts: [low, medium, high], default_effort: medium, availability: unverified, source: reviewed_policy}
+      orchestrator_model: gpt-5.6-sol
+  policy_version: braia-routing-v1
+  manual_provider: null
+  learning:
+    enabled: true
+    min_samples: 8
+    window_days: 30
+    promotion_margin: 0.15
+    cooldown_seconds: 86400
+    sustained_windows: 2
+  fallback:
+    enabled: true
+    max_attempts: 2
+session_reset:
+  mode: idle
+  idle_minutes: 720
 security:
   redact_secrets: true
   tirith_enabled: true
   tirith_path: tirith
   tirith_timeout: 5
   tirith_fail_open: true
-
-display:
-  compact: true
-  show_reasoning: false
-  memory_notifications: false
-  streaming: true
-
-session_reset:
-  mode: idle
-  idle_minutes: 720
-

@@ -1,0 +1,19 @@
+name: braia-contabilidade
+version: 1.0.11
+description: "Braia e equipe demonstrativa para escritórios de contabilidade no Hermes."
+hermes_requires: "==0.21.0"
+author: "SuperBrain Inteligência Pericial e Contábil Ltda."
+license: "Proprietary"
+env_requires:
+  - name: TELEGRAM_BOT_TOKEN
+    description: "Token exclusivo do bot da Braia Contadora"
+    required: true
+  - name: TELEGRAM_ALLOWED_USERS
+    description: "IDs Telegram autorizados"
+    required: true
+  - name: OPENAI_API_KEY
+    description: "Transcrição opcional; não usada para roteamento por assinatura"
+    required: false
+  - name: ELEVENLABS_API_KEY
+    description: "Voz ElevenLabs opcional"
+    required: false

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
 umask 027
 
 readonly SERVICE_USER="hermes-contadoria"
@@ -11,26 +10,68 @@ readonly WORKSPACE_DIR="${SERVICE_HOME}/workspace"
 readonly RUNTIME_DIR="/opt/hermes-contadoria-runtime"
 readonly KIT_MARKER="${HERMES_HOME}/.contadoria-kit-installed"
 readonly KIT_IN_PROGRESS_MARKER="${HERMES_HOME}/.contadoria-kit-installing"
-readonly HERMES_COMMIT="${HERMES_COMMIT:-03fa32c92dd445eb64c7f67434dd91b32c40701d}"
+readonly HERMES_COMMIT="${HERMES_COMMIT:-29112bef099274229cadff79cdff7bf7b99c4b77}"
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER_TMP=""
+INSTALL_SUCCEEDED=false
+SERVICE_UNIT_TRANSACTIONAL=false
+readonly INSTALL_LOCK_PATH="/run/lock/hermes-contadoria-installer.lock"
 
 cleanup() {
+  local status=$?
+  local recovery_ok=true
+  trap - EXIT
   if [[ -n "${INSTALLER_TMP}" && -f "${INSTALLER_TMP}" ]]; then
-    rm -f -- "${INSTALLER_TMP}"
+    if ! unlink -- "${INSTALLER_TMP}"; then
+      printf 'ATENÇÃO: não foi possível retirar o instalador temporário.\n' >&2
+      status=1
+    fi
   fi
+  if [[ "${INSTALL_SUCCEEDED}" != true && "${SERVICE_STATE_CAPTURED:-false}" == true ]]; then
+    if ! quiesce_service_for_recovery; then
+      printf 'ERRO: não foi possível manter o serviço parado durante a recuperação.\n' >&2
+      printf 'ERRO: recuperação abortada sem novas mutações; intervenção manual necessária.\n' >&2
+      exit 1
+    fi
+    if ! rollback_kit_artifacts; then
+      printf 'ERRO: não foi possível reverter os artefatos do kit.\n' >&2
+      recovery_ok=false
+      status=1
+    fi
+    if ! rollback_fresh_home_transaction; then
+      printf 'ERRO: não foi possível restaurar a árvore anterior do HERMES_HOME.\n' >&2
+      recovery_ok=false
+      status=1
+    fi
+    if ! rollback_runtime_transaction; then
+      printf 'ERRO: não foi possível restaurar o runtime anterior.\n' >&2
+      recovery_ok=false
+      status=1
+    fi
+    if [[ "${SERVICE_UNIT_TRANSACTIONAL}" == true ]] && ! systemctl daemon-reload; then
+      printf 'ERRO: não foi possível recarregar a unidade restaurada.\n' >&2
+      recovery_ok=false
+      status=1
+    fi
+    if [[ "${recovery_ok}" == true ]] && ! restore_service_state; then
+      printf 'ERRO: não foi possível restaurar o estado anterior do serviço.\n' >&2
+      status=1
+    elif [[ "${recovery_ok}" != true ]]; then
+      printf 'ERRO: serviço mantido parado para não observar estado parcialmente recuperado.\n' >&2
+    fi
+  fi
+  exit "${status}"
 }
 trap cleanup EXIT
 
-fail() {
-  printf 'ERRO: %s\n' "$*" >&2
-  exit 1
-}
+fail() { printf 'ERRO: %s\n' "$*" >&2; exit 1; }
 
 [[ "${EUID}" -eq 0 ]] || fail "execute como root: sudo bash install.sh"
+command -v flock >/dev/null || fail "flock é obrigatório para serializar instalações"
+exec {INSTALL_LOCK_FD}>"${INSTALL_LOCK_PATH}" || fail "não foi possível abrir o lock global"
+flock -n "${INSTALL_LOCK_FD}" || fail "outra instalação/recuperação já está em andamento"
 [[ -r /etc/os-release ]] || fail "não foi possível identificar o sistema operacional"
-
 # shellcheck disable=SC1091
 source /etc/os-release
 [[ "${ID:-}" == "ubuntu" ]] || fail "este kit suporta VPS Ubuntu 22.04 ou mais recente"
@@ -43,121 +84,139 @@ for required in \
   "${SOURCE_DIR}/templates/config.yaml" \
   "${SOURCE_DIR}/templates/profile.yaml" \
   "${SOURCE_DIR}/templates/hermes-contadoria.service.tpl" \
+  "${SOURCE_DIR}/AGENTS.md" \
+  "${SOURCE_DIR}/scripts/apply_runtime_patch.py" \
+  "${SOURCE_DIR}/scripts/configure_multi_ai.py" \
+  "${SOURCE_DIR}/scripts/install_kit_artifacts.sh" \
+  "${SOURCE_DIR}/scripts/secure_artifact.py" \
+  "${SOURCE_DIR}/scripts/runtime_transaction.sh" \
+  "${SOURCE_DIR}/scripts/service_transaction.sh" \
+  "${SOURCE_DIR}/runtime-patches/delegation-fallback.patch" \
+  "${SOURCE_DIR}/runtime-patches/previous-delegation-fallback.patch" \
+  "${SOURCE_DIR}/skills/braia-claude-login/SKILL.md" \
+  "${SOURCE_DIR}/skills/braia-claude-login/scripts/claude_login.py" \
   "${SOURCE_DIR}/.env.example"; do
   [[ -f "${required}" ]] || fail "arquivo obrigatório ausente: ${required}"
+done
+# shellcheck disable=SC1091
+source "${SOURCE_DIR}/scripts/install_kit_artifacts.sh"
+# shellcheck disable=SC1091
+source "${SOURCE_DIR}/scripts/runtime_transaction.sh"
+# shellcheck disable=SC1091
+source "${SOURCE_DIR}/scripts/service_transaction.sh"
+
+for managed_directory in \
+  "${HERMES_HOME}" "${HERMES_HOME}/agents" "${HERMES_HOME}/skills" \
+  "${HERMES_HOME}/scripts" "${HERMES_HOME}/skills/braia-claude-login" \
+  "${HERMES_HOME}/skills/braia-claude-login/scripts" \
+  "${HERMES_HOME}/backups" "${HERMES_HOME}/backups/runtime"; do
+  assert_safe_artifact_directory "${managed_directory}" || \
+    fail "diretório gerenciado inválido ou ligado simbolicamente: ${managed_directory}"
 done
 
 if [[ -d "${HERMES_HOME}" && ! -f "${KIT_MARKER}" && ! -f "${KIT_IN_PROGRESS_MARKER}" ]]; then
   existing_item="$(find "${HERMES_HOME}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)"
   [[ -z "${existing_item}" ]] || fail "${HERMES_HOME} já contém outra instalação; nada foi sobrescrito"
 fi
-
 if [[ -d "${RUNTIME_DIR}" && ! -f "${KIT_MARKER}" && ! -f "${KIT_IN_PROGRESS_MARKER}" ]]; then
   fail "${RUNTIME_DIR} já existe sem o marcador deste kit; nada foi sobrescrito"
+fi
+
+# Valide a atualização existente antes de apt, download, parada ou mutação do runtime.
+if [[ -f "${KIT_MARKER}" ]]; then
+  id "${SERVICE_USER}" >/dev/null 2>&1 || fail "marcador existe, mas usuário de serviço está ausente"
+  [[ -x "${RUNTIME_DIR}/venv/bin/python" ]] || fail "marcador existe, mas runtime Hermes está incompleto"
+  "${RUNTIME_DIR}/venv/bin/python" "${SOURCE_DIR}/scripts/apply_runtime_patch.py" \
+    --runtime "${RUNTIME_DIR}" --backup-root "${HERMES_HOME}/backups/runtime" --check >/dev/null || \
+    fail "runtime existente não passou na validação preservadora; nada foi alterado"
 fi
 
 printf '>> Preparando dependências básicas...\n'
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y ca-certificates curl git sudo
+getent group "${SERVICE_GROUP}" >/dev/null || groupadd --system "${SERVICE_GROUP}"
+id "${SERVICE_USER}" >/dev/null 2>&1 || useradd --system --create-home --home-dir "${SERVICE_HOME}" --gid "${SERVICE_GROUP}" --shell /bin/bash "${SERVICE_USER}"
+install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${WORKSPACE_DIR}"
 
-if ! getent group "${SERVICE_GROUP}" >/dev/null; then
-  groupadd --system "${SERVICE_GROUP}"
-fi
+capture_service_state
+stop_service_for_update
 
-if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
-  useradd --system --create-home --home-dir "${SERVICE_HOME}" \
-    --gid "${SERVICE_GROUP}" --shell /bin/bash "${SERVICE_USER}"
-fi
-
-install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
-  "${HERMES_HOME}" "${WORKSPACE_DIR}"
+artifact_backup="/var/backups/hermes-contadoria/kit-artifacts/$(date -u +%Y%m%dT%H%M%SZ)"
+begin_fresh_home_transaction "${HERMES_HOME}" "${artifact_backup}"
+install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${HERMES_HOME}"
+begin_kit_artifact_transaction "${artifact_backup}" root root
+register_kit_artifact_target "${KIT_MARKER}" "${SERVICE_USER}" "${SERVICE_GROUP}"
+register_kit_artifact_target "${KIT_IN_PROGRESS_MARKER}" "${SERVICE_USER}" "${SERVICE_GROUP}"
+runtime_backup="/var/backups/hermes-contadoria/runtime/$(date -u +%Y%m%dT%H%M%SZ)"
+begin_runtime_transaction "${RUNTIME_DIR}" "${runtime_backup}"
 
 if [[ ! -f "${KIT_MARKER}" && ! -f "${KIT_IN_PROGRESS_MARKER}" ]]; then
-  printf '%s\n' \
-    "Instalação do kit Comunidade ContadorIA em andamento." \
-    "Hermes commit: ${HERMES_COMMIT}" > "${KIT_IN_PROGRESS_MARKER}"
-  chown "${SERVICE_USER}:${SERVICE_GROUP}" "${KIT_IN_PROGRESS_MARKER}"
-  chmod 0644 "${KIT_IN_PROGRESS_MARKER}"
+  marker_tmp="$(mktemp)"
+  printf '%s\n' "Instalação do kit Comunidade ContadorIA em andamento." "Hermes commit: ${HERMES_COMMIT}" > "${marker_tmp}"
+  atomic_install_artifact "${marker_tmp}" "${KIT_IN_PROGRESS_MARKER}" 0644 "${SERVICE_USER}" "${SERVICE_GROUP}"
+  unlink -- "${marker_tmp}"
 fi
+
+install_kit_artifacts "${SOURCE_DIR}" "${HERMES_HOME}" "${SERVICE_USER}" "${SERVICE_GROUP}" "${artifact_backup}" "${WORKSPACE_DIR}"
 
 printf '>> Baixando o instalador oficial do Hermes no commit fixado %s...\n' "${HERMES_COMMIT}"
 INSTALLER_TMP="$(mktemp /tmp/hermes-contadoria-install.XXXXXX)"
-curl --fail --silent --show-error --location \
-  --proto '=https' --tlsv1.2 \
-  "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_COMMIT}/scripts/install.sh" \
-  --output "${INSTALLER_TMP}"
-
+curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_COMMIT}/scripts/install.sh" --output "${INSTALLER_TMP}"
 grep -q -- '--no-skills' "${INSTALLER_TMP}" || fail "o instalador oficial baixado não oferece --no-skills"
 
-printf '>> Instalando Hermes sem skills...\n'
-HERMES_HOME="${HERMES_HOME}" HERMES_INSTALL_DIR="${RUNTIME_DIR}" \
-  bash "${INSTALLER_TMP}" \
-    --dir "${RUNTIME_DIR}" \
-    --hermes-home "${HERMES_HOME}" \
-    --branch main \
-    --commit "${HERMES_COMMIT}" \
-    --no-skills \
-    --skip-setup \
-    --non-interactive
+printf '>> Instalando Hermes sem o catálogo público de skills...\n'
+HERMES_HOME="${HERMES_HOME}" HERMES_INSTALL_DIR="${RUNTIME_DIR}" bash "${INSTALLER_TMP}" \
+  --dir "${RUNTIME_DIR}" --hermes-home "${HERMES_HOME}" --branch main --commit "${HERMES_COMMIT}" \
+  --no-skills --skip-setup --non-interactive
 
-# O instalador roda como root. Torna o checkout/venv executável pelo grupo
-# isolado do serviço sem abrir o runtime para outros usuários do sistema.
+printf '>> Aplicando extensão revisada de roteamento por tarefa...\n'
+install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${HERMES_HOME}/backups/runtime"
+"${RUNTIME_DIR}/venv/bin/python" "${SOURCE_DIR}/scripts/apply_runtime_patch.py" \
+  --runtime "${RUNTIME_DIR}" --backup-root "${HERMES_HOME}/backups/runtime"
+if [[ -f "${KIT_MARKER}" ]]; then
+  printf '>> Migrando a configuração preservada para a política de roteamento atual...\n'
+  register_kit_artifact_target "${HERMES_HOME}/config.yaml" "${SERVICE_USER}" "${SERVICE_GROUP}"
+  HERMES_HOME="${HERMES_HOME}" "${RUNTIME_DIR}/venv/bin/python" \
+    "${SOURCE_DIR}/scripts/configure_multi_ai.py"
+fi
 chown -R "root:${SERVICE_GROUP}" "${RUNTIME_DIR}"
 chmod -R g+rX,o-rwx "${RUNTIME_DIR}"
 
-first_kit_install=true
-if [[ -f "${KIT_MARKER}" ]]; then
-  first_kit_install=false
-fi
-
-if [[ "${first_kit_install}" == true ]]; then
-  printf '>> Aplicando a configuração pública da Comunidade ContadorIA...\n'
-
-  config_tmp="$(mktemp /tmp/hermes-contadoria-config.XXXXXX)"
-  sed "s|__WORKSPACE__|${WORKSPACE_DIR}|g" \
-    "${SOURCE_DIR}/templates/config.yaml" > "${config_tmp}"
-
-  install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
-    "${config_tmp}" "${HERMES_HOME}/config.yaml"
-  rm -f -- "${config_tmp}"
-
-  install -m 0600 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
-    "${SOURCE_DIR}/.env.example" "${HERMES_HOME}/.env"
-  install -m 0644 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
-    "${SOURCE_DIR}/templates/SOUL.md" "${HERMES_HOME}/SOUL.md"
-  install -m 0644 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
-    "${SOURCE_DIR}/templates/profile.yaml" "${HERMES_HOME}/profile.yaml"
-
-  install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
-    "${HERMES_HOME}/agents" "${HERMES_HOME}/skills"
-  find "${SOURCE_DIR}/agents" -maxdepth 1 -type f -name '*.md' -print0 | \
-    xargs -0 -I{} install -m 0644 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" \
-      "{}" "${HERMES_HOME}/agents/"
-
-  printf '%s\n' \
-    "Comunidade ContadorIA kit" \
-    "Hermes commit: ${HERMES_COMMIT}" > "${KIT_MARKER}"
-  chown "${SERVICE_USER}:${SERVICE_GROUP}" "${KIT_MARKER}"
-  chmod 0644 "${KIT_MARKER}"
-  rm -f -- "${KIT_IN_PROGRESS_MARKER}"
+if [[ ! -f "${KIT_MARKER}" ]]; then
+  marker_tmp="$(mktemp)"
+  printf '%s\n' "Comunidade ContadorIA kit" "Hermes commit: ${HERMES_COMMIT}" > "${marker_tmp}"
+  atomic_install_artifact "${marker_tmp}" "${KIT_MARKER}" 0644 "${SERVICE_USER}" "${SERVICE_GROUP}"
+  unlink -- "${marker_tmp}"
+  [[ ! -f "${KIT_IN_PROGRESS_MARKER}" ]] || unlink -- "${KIT_IN_PROGRESS_MARKER}"
 else
-  printf '>> Kit já instalado; preservando SOUL.md, agentes, configuração e credenciais locais.\n'
+  printf '>> Kit atualizado; identidade, agentes, configuração e credenciais locais foram preservados.\n'
 fi
 
-[[ -f "${HERMES_HOME}/.no-bundled-skills" ]] || \
-  fail "o marcador .no-bundled-skills não foi criado"
-
-skill_item="$(find "${HERMES_HOME}/skills" -mindepth 1 -print -quit 2>/dev/null || true)"
-[[ -z "${skill_item}" ]] || fail "a instalação deveria estar sem skills, mas encontrou: ${skill_item}"
-
-install -m 0644 "${SOURCE_DIR}/templates/hermes-contadoria.service.tpl" \
-  /etc/systemd/system/hermes-contadoria.service
+[[ -f "${HERMES_HOME}/.no-bundled-skills" ]] || fail "o marcador .no-bundled-skills não foi criado"
+[[ -f "${HERMES_HOME}/skills/braia-claude-login/SKILL.md" ]] || fail "skill operacional de login Claude não foi instalada"
+[[ -x "${HERMES_HOME}/scripts/configure_multi_ai.py" ]] || fail "configurador multi-IA não foi instalado"
+register_kit_artifact_target "/etc/systemd/system/hermes-contadoria.service" root root
+SERVICE_UNIT_TRANSACTIONAL=true
+atomic_install_artifact "${SOURCE_DIR}/templates/hermes-contadoria.service.tpl" \
+  /etc/systemd/system/hermes-contadoria.service 0644 root root
 systemctl daemon-reload
-
 chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${HERMES_HOME}" "${WORKSPACE_DIR}"
 chmod 0700 "${HERMES_HOME}"
 chmod 0600 "${HERMES_HOME}/.env"
+cleanup_kit_artifact_temporaries || fail "não foi possível limpar temporários da transação"
+[[ -d "${RUNTIME_DIR}" && ! -L "${RUNTIME_DIR}" ]] || fail "runtime novo inválido antes da ativação"
+[[ -d "${HERMES_HOME}" && ! -L "${HERMES_HOME}" ]] || fail "HERMES_HOME novo inválido antes da ativação"
+restore_service_state || fail "serviço não voltou ao estado anterior"
+INSTALL_SUCCEEDED=true
+KIT_ARTIFACT_TRANSACTION_ACTIVE=false
+RUNTIME_TRANSACTION_ACTIVE=false
+FRESH_HOME_TRANSACTION_ACTIVE=false
+archive_home_transaction_snapshot || \
+  printf 'ATENÇÃO: snapshot anterior do HERMES_HOME permaneceu na área transacional local.\n' >&2
+archive_runtime_transaction_snapshot || \
+  printf 'ATENÇÃO: snapshot anterior do runtime permaneceu na área transacional local.\n' >&2
 
-printf '\nInstalação-base concluída. O serviço ainda não foi iniciado.\n'
-printf 'Próximo passo: sudo bash configure.sh\n'
+printf '\nInstalação-base concluída. Serviço anterior restaurado, se aplicável.\n'
+printf 'Próximo passo para instalação nova: sudo bash configure.sh\n'

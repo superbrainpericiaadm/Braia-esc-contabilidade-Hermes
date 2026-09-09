@@ -1,0 +1,76 @@
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 7990d88ad2..765f4f8828 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2088,6 +2088,9 @@ DEFAULT_CONFIG = {
+     # Uses the same runtime provider resolution as CLI/gateway startup, so all
+     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
+     "delegation": {
++        # Explicit child fallback chain (provider/model mappings), even with
++        # a pinned provider. None preserves inheritance; [] disables fallback.
++        "fallback_providers": None,
+         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
+         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index e459344a83..40dba54e09 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -1975,23 +1975,31 @@ def _build_child_agent(
+     except Exception as exc:
+         logger.debug("Could not load delegation reasoning_effort: %s", exc)
+ 
+-    # Inherit the parent's fallback provider chain so subagents can recover
+-    # from rate-limits and credential exhaustion exactly like the top-level
+-    # agent does.  _fallback_chain is a list accepted by AIAgent's
+-    # fallback_model parameter (which handles both list and dict forms).
+-    #
+-    # EXCEPT when the user pinned delegation.provider: an explicit pin means
+-    # "children run on THIS provider".  Inheriting the parent chain would let
+-    # a mid-run auth/429 failure silently reroute the quiet-mode child onto
+-    # the parent's fallback models with no surfaced signal (#80450) — the
+-    # same class of silent-drag the override_provider filter-clearing below
+-    # already prevents for OpenRouter routing preferences.  Predictability >
+-    # liveness for explicit pins: the pinned child fails loudly instead.
+-    parent_fallback = (
+-        None
+-        if override_provider
+-        else (getattr(parent_agent, "_fallback_chain", None) or None)
+-    )
++    # A provider pin keeps children on that provider unless the operator
++    # explicitly supplies delegation.fallback_providers. Null preserves the
++    # legacy inheritance policy; [] explicitly disables all child fallbacks.
++    child_fallback = delegation_cfg.get("fallback_providers")
++    if child_fallback is None:
++        child_fallback = (
++            None if override_provider
++            else (getattr(parent_agent, "_fallback_chain", None) or None)
++        )
++    else:
++        if not isinstance(child_fallback, list) or any(
++            not isinstance(entry, dict)
++            or not isinstance(entry.get("provider"), str)
++            or not entry["provider"].strip()
++            or not isinstance(entry.get("model"), str)
++            or not entry["model"].strip()
++            for entry in child_fallback
++        ):
++            raise ValueError(
++                "delegation.fallback_providers must be a list of provider/model mappings"
++            )
++        # The shared config loader returns a cached mapping. Never hand its
++        # mutable entries to an agent that may prune its runtime chain.
++        from copy import deepcopy
++        child_fallback = deepcopy(child_fallback)
+ 
+     # Inherit the parent's OpenRouter provider-preference filters by default
+     # (so subagents routed to the same provider honour the same routing
+@@ -2081,7 +2089,7 @@ def _build_child_agent(
+ 
+                 reasoning_config=child_reasoning,
+                 prefill_messages=getattr(parent_agent, "prefill_messages", None),
+-                fallback_model=parent_fallback,
++                fallback_model=child_fallback,
+                 enabled_toolsets=child_toolsets,
+                 disabled_toolsets=child_disabled_toolsets,
+                 quiet_mode=True,

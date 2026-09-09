@@ -1,0 +1,1249 @@
+diff --git a/agent/braia_routing.py b/agent/braia_routing.py
+new file mode 100644
+index 0000000000..10d12d1137
+--- /dev/null
++++ b/agent/braia_routing.py
+@@ -0,0 +1,841 @@
++"""Braia task routing. Local policy/catalog; no prompts or credentials in state.
++
++The verifier API is trusted host integration, deliberately NOT a model tool.
++Completion records remain unreviewed until a verifier supplies an evidence hash.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from copy import deepcopy
++from functools import wraps
++import hashlib
++import json
++import math
++import os
++from pathlib import Path
++import re
++import sqlite3
++import threading
++import time
++import uuid
++import weakref
++
++TIERS = {"routine": 0, "normal": 1, "complex": 2, "exceptional": 3}
++PROVIDERS = {"anthropic", "openai-codex"}
++PROVIDER_ERRORS = {"auth", "auth_permanent", "billing", "rate_limit",
++                   "upstream_rate_limit", "overloaded", "server_error", "timeout", "model_not_found", "unsupported_model"}
++SLUG = re.compile(r"[a-z0-9][a-z0-9_.-]{0,95}\Z")
++_LOCKS_GUARD = threading.Lock()
++
++
++def _digest(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
++
++
++def _observed_tokens(agent):
++    values = [getattr(agent, field, None) for field in ("session_prompt_tokens", "session_completion_tokens")]
++    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in values):
++        return None
++    return sum(values)
++
++
++def _finish_attempt(agent, state, status):
++    current, baseline = _observed_tokens(agent), state.get("tokens_start")
++    usage = max(0, current-baseline) if current is not None and baseline is not None else None
++    state["store"].finish(state["id"], status, time.monotonic()-state["started"], usage)
++
++
++def _slug(value, field):
++    if not isinstance(value, str) or not SLUG.fullmatch(value):
++        raise ValueError(f"Braia {field} must be a non-sensitive routine/version slug")
++    return value
++
++
++def _number(value, field, low, high, integer=False):
++    if (isinstance(value, bool) or not isinstance(value, (int, float))
++            or not math.isfinite(value) or not low <= value <= high
++            or (integer and not isinstance(value, int))):
++        raise ValueError(f"Braia {field} must be in [{low}, {high}]")
++    return value
++
++
++def validate_config(raw):
++    if raw is None or raw == {}:
++        return None
++    if not isinstance(raw, dict):
++        raise ValueError("braia_routing must be an object")
++    if raw.get("enabled", False) is False:
++        return None
++    cfg = deepcopy(raw)
++    if cfg.get("enabled") is not True or cfg.get("schema_version") != 1:
++        raise ValueError("Braia routing requires enabled=true and schema_version=1")
++    _slug(cfg.get("policy_version"), "policy_version")
++    providers = cfg.get("providers")
++    if not isinstance(providers, dict) or not providers or not set(providers) <= PROVIDERS:
++        raise ValueError("Braia routing supports connected anthropic/openai-codex subscriptions")
++    if cfg.get("initial_provider") not in PROVIDERS:
++        raise ValueError("Braia initial_provider must identify a supported subscription")
++    if cfg.get("manual_provider") is not None and cfg["manual_provider"] not in PROVIDERS:
++        raise ValueError("Braia manual_provider must identify a supported subscription")
++    for field in ("initial_tier", "manual_tier"):
++        if cfg.get(field) is not None and cfg[field] not in TIERS:
++            raise ValueError("Braia invalid saved preference tier")
++    for provider, entry in providers.items():
++        if not isinstance(entry, dict) or not isinstance(entry.get("models"), dict) or not entry["models"]:
++            raise ValueError("Braia provider requires an authorized models catalog")
++        for model, spec in entry["models"].items():
++            if (not isinstance(model, str) or len(model) > 160
++                    or not re.fullmatch(r"[a-zA-Z0-9_.:/-]+", model)
++                    or not isinstance(spec, dict) or spec.get("tier") not in TIERS):
++                raise ValueError("Braia invalid catalog model/tier")
++            # Family check complements the account-authorized allowlist.
++            if not model.startswith("claude-" if provider == "anthropic" else "gpt-"):
++                raise ValueError("Braia model outside provider family")
++            efforts = spec.get("efforts", [])
++            if not isinstance(efforts, list) or any(e not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"} for e in efforts):
++                raise ValueError("Braia invalid effort catalog")
++            if spec.get("default_effort") is not None and spec["default_effort"] not in efforts:
++                raise ValueError("Braia default_effort outside model capability")
++        if entry.get("orchestrator_model") not in entry["models"]:
++            raise ValueError("Braia orchestrator_model missing from catalog")
++    learning = cfg.setdefault("learning", {})
++    fallback = cfg.setdefault("fallback", {})
++    if not isinstance(learning, dict) or not isinstance(fallback, dict):
++        raise ValueError("Braia learning/fallback must be objects")
++    for section in (learning, fallback):
++        if not isinstance(section.setdefault("enabled", True), bool):
++            raise ValueError("Braia enabled flags must be boolean")
++    defaults = {"min_samples": (8, 2, 1000, True), "window_days": (30, 1, 365, False),
++                "promotion_margin": (0.15, 0.01, 1, False),
++                "cooldown_seconds": (86400, 0, 31536000, False),
++                "sustained_windows": (2, 2, 10, True)}
++    for name, (default, low, high, integer) in defaults.items():
++        _number(learning.setdefault(name, default), name, low, high, integer)
++    _number(fallback.setdefault("max_attempts", 2), "max_attempts", 1, 2, True)
++    return cfg
++
++
++validate_policy = validate_config
++
++
++def profile_for(agent=None):
++    explicit = getattr(agent, "_braia_profile", None) if agent is not None else None
++    if explicit:
++        return Path(explicit).resolve()
++    db = getattr(getattr(agent, "_session_db", None), "db_path", None)
++    if isinstance(db, (str, Path)) and str(db) != ":memory:":
++        return Path(db).resolve().parent
++    from hermes_constants import get_hermes_home
++    return Path(get_hermes_home()).resolve()
++
++
++def load_policy(agent=None):
++    if os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
++        return None
++    import yaml
++    path = profile_for(agent) / "config.yaml"
++    if not path.exists():
++        return None
++    with path.open(encoding="utf-8") as handle:
++        full = yaml.safe_load(handle) or {}
++    if not isinstance(full, dict):
++        raise ValueError("Braia profile config must be an object")
++    return validate_config(full.get("braia_routing"))
++
++
++def _compression_successor(db, parent_id):
++    """Select one native continuation edge, without the tip walk's 100-hop cap.
++
++    This adapter mirrors SessionDB.get_compression_tip's reviewed SQL ordering
++    on the pinned Hermes tree. Checking each edge also rejects sibling branches;
++    equality of bounded forward tips cannot establish that ownership.
++    """
++    with db._read_ctx() as conn:
++        row = conn.execute("""
++            SELECT child.id
++            FROM sessions parent
++            JOIN sessions child ON child.parent_session_id = parent.id
++            WHERE parent.id = ?
++              AND parent.end_reason = 'compression'
++              AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
++              AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
++              AND COALESCE(child.source, '') != 'tool'
++            ORDER BY
++              CASE WHEN child.end_reason = 'compression' THEN 0
++                   WHEN child.ended_at IS NULL THEN 1 ELSE 2 END,
++              COALESCE((SELECT MAX(_act_v.v) FROM (
++                SELECT child.last_activity_at AS v
++                UNION ALL
++                SELECT (SELECT MAX(_act_m.timestamp) FROM messages _act_m
++                        WHERE _act_m.session_id = child.id)
++              ) _act_v), child.started_at) DESC,
++              child.started_at DESC,
++              child.id DESC
++            LIMIT 1
++        """, (parent_id,)).fetchone()
++    return row["id"] if row is not None else None
++
++
++def session_owner(agent):
++    """Host-only authority: durable root session and its actual profile/DB.
++
++    Never read tool arguments, UI environment context (child construction can
++    rebind it), task context, or a model-supplied execution ID as authority.
++    Missing/closed DBs and non-compression branches fail closed for review.
++    """
++    if getattr(agent, "_delegate_depth", 0) != 0:
++        return None
++    sid = getattr(agent, "session_id", None)
++    db = getattr(agent, "_session_db", None)
++    db_path = getattr(db, "db_path", None)
++    if not isinstance(sid, str) or not sid or not isinstance(db_path, (str, Path)) or str(db_path) == ":memory:":
++        return None
++    profile = profile_for(agent)
++    db_path = Path(db_path).resolve()
++    if db_path.parent != profile:
++        return None
++    try:
++        seen = set()
++        row = db.get_session(sid)
++        # Session length is not an authority boundary. Walk every valid native
++        # compression edge; the seen set terminates malformed cycles.
++        while True:
++            if not isinstance(row, dict) or row.get("id") != sid or sid in seen:
++                return None
++            seen.add(sid)
++            if row.get("source") in {"delegate", "subagent", "background_review"}:
++                return None
++            previous = row.get("parent_session_id")
++            if not previous:
++                return _digest({"profile": str(profile), "db": str(db_path), "session": sid})
++            previous_row = db.get_session(previous)
++            # A delegation or user branch must not inherit review authority.
++            # Only the native compression chain may retain this owner key.
++            if (not isinstance(previous_row, dict) or previous_row.get("end_reason") != "compression"
++                    or _compression_successor(db, previous) != sid):
++                return None
++            sid, row = previous, previous_row
++    except Exception:
++        return None
++    return None
++
++
++def context_key(context, cfg):
++    task_type = _slug(context.get("task_type"), "task_type")
++    acceptance = _slug(context.get("acceptance_id"), "acceptance_id")
++    complexity = context.get("complexity")
++    if complexity not in TIERS:
++        raise ValueError("Braia complexity must be routine/normal/complex/exceptional")
++    return _digest([task_type, complexity, acceptance, context.get("_role", "worker"),
++                    bool(context.get("_continuation", False)), context.get("model"),
++                    context.get("effort") if "effort" in context else None,
++                    cfg["policy_version"], cfg["providers"]])
++
++
++def task_key(context, cfg):
++    normalized = {k: v for k, v in context.items() if k not in {"model", "effort", "justification"}}
++    return context_key(normalized, cfg)
++
++
++def effective_effort(spec, explicit=None):
++    if explicit is not None and explicit not in spec.get("efforts", []):
++        raise ValueError("Braia effort unsupported by selected model")
++    return explicit if explicit is not None else spec.get("default_effort")
++
++
++def validate_task(task, provider, cfg):
++    route = task.get("routing")
++    if not isinstance(route, dict):
++        raise ValueError("Braia each task requires routing metadata")
++    context_key(route, cfg)
++    spec = cfg["providers"].get(provider, {}).get("models", {}).get(route.get("model"))
++    if spec is None or spec.get("availability") == "unavailable":
++        raise ValueError("Braia task model must belong to active parent provider catalog")
++    if TIERS[spec["tier"]] < TIERS[route["complexity"]]:
++        raise ValueError("Braia task model capacity below task complexity")
++    if (not isinstance(route.get("justification"), str)
++            or not route["justification"].strip() or len(route["justification"]) > 2000):
++        raise ValueError("Braia task requires a bounded selection justification")
++    if "effort" not in route:
++        raise ValueError("Braia routing.effort required (null for model default)")
++    effort = route["effort"]
++    if effort is not None and effort not in spec.get("efforts", []):
++        raise ValueError("Braia effort unsupported by selected model")
++    return deepcopy(route)
++
++
++def reasoning_for(spec, effort=None):
++    effort = effort if effort is not None else spec.get("default_effort")
++    if effort is None:
++        return None
++    from hermes_constants import parse_reasoning_effort
++    parsed = parse_reasoning_effort(effort)
++    if parsed is None:
++        raise ValueError("Braia effort unsupported by Hermes runtime")
++    return parsed
++
++
++def fallback_candidates(cfg, provider, model, complexity, orchestrator=False, effort=None):
++    if not cfg["fallback"]["enabled"] or cfg["fallback"]["max_attempts"] < 2:
++        return []
++    spec = cfg["providers"].get(provider, {}).get("models", {}).get(model)
++    saved_tier = cfg.get("initial_tier") if provider == cfg["initial_provider"] else cfg.get("manual_tier")
++    tier = spec["tier"] if spec else saved_tier
++    if tier not in TIERS:
++        return []  # no capability evidence for the disconnected preference
++    # The configured orchestrator coordinates the planned work; its own tier
++    # need not equal the worker's complexity. Failover preserves its own tier.
++    required = TIERS[tier] if orchestrator else max(TIERS[complexity], TIERS[tier])
++    result = []
++    for other, entry in cfg["providers"].items():
++        if other == provider:
++            continue
++        choices = [(TIERS[spec["tier"]], name) for name, spec in entry["models"].items()
++                   if TIERS[spec["tier"]] >= required and spec.get("availability") != "unavailable"
++                   and (not orchestrator or name == entry["orchestrator_model"])
++                   and (effort is None or effort in spec.get("efforts", []))]
++        if choices:
++            result.append({"provider": other, "model": min(choices)[1]})
++    return result[:cfg["fallback"]["max_attempts"] - 1]
++
++
++class Store:
++    def __init__(self, profile):
++        profile = Path(profile).resolve()
++        if not profile.is_dir():
++            raise ValueError("Braia profile directory does not exist")
++        self.path = profile / "braia-routing.sqlite3"
++        if self.path.is_symlink():
++            raise ValueError("Braia history must not be a symlink")
++        try:
++            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
++            os.close(fd)
++        except FileExistsError:
++            pass
++        with self.tx() as db:
++            db.execute("CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, bucket TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, created REAL NOT NULL, finished REAL, latency REAL, status TEXT, verdict TEXT, evidence TEXT, verifier TEXT, rework INTEGER DEFAULT 0, usage REAL, tier TEXT, effort TEXT)")
++            # Additive migration under BEGIN IMMEDIATE, safe across processes.
++            # Legacy IDs deliberately remain unowned: never backfill from a
++            # review request or from model-visible transcripts.
++            columns = {row[1] for row in db.execute("PRAGMA table_info(executions)")}
++            if "owner" not in columns:
++                db.execute("ALTER TABLE executions ADD COLUMN owner TEXT")
++            if "tier" not in columns:
++                db.execute("ALTER TABLE executions ADD COLUMN tier TEXT")
++            if "effort" not in columns:
++                db.execute("ALTER TABLE executions ADD COLUMN effort TEXT")
++            db.execute("CREATE INDEX IF NOT EXISTS bucket_time ON executions(bucket, created)")
++            db.execute("CREATE TABLE IF NOT EXISTS priorities (bucket TEXT PRIMARY KEY, provider TEXT NOT NULL, changed REAL NOT NULL, reason TEXT NOT NULL)")
++            db.execute("CREATE TABLE IF NOT EXISTS promotions (id INTEGER PRIMARY KEY, bucket TEXT, previous TEXT, provider TEXT, created REAL, reason TEXT)")
++
++    @contextmanager
++    def tx(self):
++        db = sqlite3.connect(self.path, timeout=15, isolation_level=None)
++        db.row_factory = sqlite3.Row
++        try:
++            db.execute("PRAGMA busy_timeout=15000")
++            db.execute("BEGIN IMMEDIATE")
++            yield db
++            db.commit()
++        except BaseException:
++            db.rollback()
++            raise
++        finally:
++            db.close()
++
++    def begin(self, cfg, context, provider, model, now=None, *, owner=None):
++        spec = cfg["providers"].get(provider, {}).get("models", {}).get(model)
++        if spec is None:
++            raise ValueError("Braia execution not in authorized catalog")
++        effort = effective_effort(spec, context.get("effort"))
++        now = time.time() if now is None else now
++        execution_id = uuid.uuid4().hex
++        with self.tx() as db:
++            db.execute("INSERT INTO executions(id,bucket,provider,model,created,owner,tier,effort) VALUES(?,?,?,?,?,?,?,?)",
++                       (execution_id, task_key(context, cfg), provider, model, now, owner, spec["tier"], effort))
++            # Bounded retention. Reviewers must submit evidence before expiry.
++            db.execute("DELETE FROM executions WHERE created < ?", (now - cfg["learning"]["window_days"] * 86400,))
++            db.execute("DELETE FROM executions WHERE id IN (SELECT id FROM executions ORDER BY created DESC LIMIT -1 OFFSET 10000)")
++            db.execute("DELETE FROM promotions WHERE id IN (SELECT id FROM promotions ORDER BY id DESC LIMIT -1 OFFSET 1000)")
++        return execution_id
++
++    def finish(self, execution_id, status, latency, usage=None):
++        if status not in {"completed", "runtime_error", "interrupted"} | PROVIDER_ERRORS:
++            raise ValueError("Braia invalid execution status")
++        _number(latency, "latency", 0, 31536000)
++        if usage is not None:
++            _number(usage, "usage", 0, 1e12)
++        with self.tx() as db:
++            db.execute("UPDATE executions SET finished=?,status=?,latency=?,usage=? WHERE id=? AND finished IS NULL",
++                       (time.time(), status, latency, usage, execution_id))
++
++    def verdict(self, execution_id, verdict, evidence_digest, verifier, rework=0, *, owner=None):
++        if verdict not in {"accepted", "rejected"}:
++            raise ValueError("Braia verdict must be accepted/rejected")
++        if not isinstance(evidence_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", evidence_digest):
++            raise ValueError("Braia verifier requires SHA256 evidence digest")
++        _slug(verifier, "verifier")
++        _number(rework, "rework", 0, 100000, True)
++        with self.tx() as db:
++            row = db.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
++            if owner is not None and (row is None or row["owner"] != owner):
++                raise ValueError("Braia review requires an execution owned by this parent/profile/session")
++            if row is None or row["status"] != "completed":
++                raise ValueError("Braia verdict requires a completed known execution")
++            values = (verdict, evidence_digest, _digest(verifier), rework)
++            if row["verdict"] is not None:
++                if tuple(row[k] for k in ("verdict", "evidence", "verifier", "rework")) == values:
++                    return  # idempotent verifier delivery
++                raise ValueError("Braia conflicting verdict for execution")
++            db.execute("UPDATE executions SET verdict=?,evidence=?,verifier=?,rework=? WHERE id=?", (*values, execution_id))
++
++    def choose(self, cfg, context, available, now=None):
++        now = time.time() if now is None else now
++        initial = cfg["initial_provider"]
++        manual = cfg.get("manual_provider")
++        if manual is not None:
++            return manual, "manual"
++        learning = cfg["learning"]
++        if not learning["enabled"]:
++            return initial, "initial_learning_disabled"
++        bucket = task_key(context, cfg)
++        with self.tx() as db:
++            prior = db.execute("SELECT * FROM priorities WHERE bucket=?", (bucket,)).fetchone()
++            current = prior["provider"] if prior else initial
++            if current not in cfg["providers"]:
++                current = initial
++            if prior and now - prior["changed"] < learning["cooldown_seconds"]:
++                return current, "cooldown"
++            rows = db.execute("SELECT * FROM executions WHERE bucket=? AND created>=? AND created<=? AND finished IS NOT NULL ORDER BY created DESC, id DESC",
++                              (bucket, now-learning["window_days"]*86400, now)).fetchall()
++            # Each sustained window uses NEW, disjoint samples per candidate.
++            # Polling the same evidence cannot increase the support count.
++            n, windows = learning["min_samples"], learning["sustained_windows"]
++            def comparable(provider):
++                entry = cfg["providers"][provider]
++                choices = [(name, spec) for name, spec in entry["models"].items()
++                           if spec["tier"] == context["complexity"] and spec.get("availability") != "unavailable"]
++                if not choices:
++                    return None
++                model, spec = min(choices)
++                return model, spec["tier"], effective_effort(spec)
++            signatures = {provider: comparable(provider) for provider in cfg["providers"]}
++            def stats(provider):
++                signature = signatures.get(provider)
++                if signature is None:
++                    return None
++                model, tier, effort = signature
++                data = [r for r in rows if r["provider"] == provider
++                        and r["model"] == model and r["tier"] == tier and r["effort"] == effort
++                        and (r["verdict"] is not None or r["status"] in PROVIDER_ERRORS)]
++                reviewed = [r for r in data if r["verdict"] is not None]
++                if len(reviewed) < n * windows:
++                    return None
++                result = []
++                for index in range(windows):
++                    sample = reviewed[index*n:(index+1)*n]
++                    oldest = min(r["created"] for r in sample)
++                    newest = now if index == 0 else min(r["created"] for r in reviewed[(index-1)*n:index*n])
++                    failures = sum(r["status"] in PROVIDER_ERRORS for r in data if oldest <= r["created"] < newest)
++                    result.append((sum(r["verdict"] == "accepted" for r in sample)/n,
++                                   n/(n+failures), sum(r["latency"] for r in sample)/n,
++                                   sum(r["rework"] for r in sample)/n,
++                                   sum(r["usage"] for r in sample)/n if all(r["usage"] is not None for r in sample) else None))
++                return result
++            incumbent = stats(current)
++            if incumbent is None:
++                return current, "insufficient_evidence"
++            margin = learning["promotion_margin"]
++            def better(new, old):
++                # Quality and reliability may not regress to buy speed.
++                if new[0] < old[0] or new[1] < old[1] or new[3] > old[3]:
++                    return False
++                return (new[0]-old[0] >= margin or new[1]-old[1] >= margin
++                        or (new[0] == old[0] and new[1] == old[1]
++                            and old[2] > 0 and (old[2]-new[2])/old[2] >= margin)
++                        or (new[0] == old[0] and new[1] == old[1] and new[2] <= old[2]
++                            and new[4] is not None and old[4] is not None and old[4] > 0
++                            and (old[4]-new[4])/old[4] >= margin))
++            for candidate in sorted(available):
++                if candidate == current or candidate not in cfg["providers"]:
++                    continue
++                if signatures.get(candidate) is None or signatures[candidate][1:] != signatures[current][1:]:
++                    continue
++                challenger = stats(candidate)
++                if challenger is not None and all(better(new, old) for new, old in zip(challenger, incumbent)):
++                    reason = json.dumps({"kind": "verified_sustained_advantage", "min_samples": n,
++                                         "windows": windows, "margin": margin,
++                                         "incumbent": incumbent, "candidate": challenger}, separators=(",", ":"))
++                    db.execute("INSERT INTO priorities VALUES(?,?,?,?) ON CONFLICT(bucket) DO UPDATE SET provider=excluded.provider,changed=excluded.changed,reason=excluded.reason",
++                               (bucket, candidate, now, reason))
++                    db.execute("INSERT INTO promotions(bucket,previous,provider,created,reason) VALUES(?,?,?,?,?)", (bucket, current, candidate, now, reason))
++                    return candidate, "verified_sustained_advantage"
++            return current, "retain_priority"
++
++
++def record_verdict(profile, execution_id, verdict, evidence_digest, verifier, rework=0):
++    """Trusted verifier only: digest references retained evidence outside history."""
++    Store(profile).verdict(execution_id, verdict, evidence_digest, verifier, rework)
++
++
++def _runtime(provider, model, profile):
++    # Hermes credential resolvers currently use process-level HERMES_HOME.
++    # Never switch it inside concurrent gateway requests. Refuse cross-profile
++    # resolution until upstream supplies an explicit profile-aware resolver.
++    from hermes_constants import get_hermes_home
++    if Path(get_hermes_home()).resolve() != Path(profile).resolve():
++        raise ValueError("Braia cross-profile credential resolution unavailable; start runtime in target profile")
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++    runtime = resolve_runtime_provider(requested=provider, target_model=model)
++    if runtime.get("provider") != provider or not runtime.get("api_key"):
++        raise ValueError("Braia subscription is not connected")
++    if provider == "anthropic" and not str(runtime["api_key"]).startswith("sk-ant-oat"):
++        raise ValueError("Braia requires Claude subscription OAuth, not Anthropic API key")
++    return runtime
++
++
++def _switch(agent, provider, model, cfg, profile, effort=None):
++    runtime = _runtime(provider, model, profile)
++    agent._braia_automatic_switch = True
++    try:
++        result = agent.switch_model(model, provider, api_key=runtime.get("api_key", ""),
++                                    base_url=runtime.get("base_url", ""), api_mode=runtime.get("api_mode", ""),
++                                    capabilities=runtime.get("capabilities"))
++    finally:
++        agent._braia_automatic_switch = False
++    if result is False or getattr(agent, "provider", None) != provider or getattr(agent, "model", None) != model:
++        raise ValueError("Braia provider switch failed")
++    agent.reasoning_config = reasoning_for(cfg["providers"][provider]["models"][model], effort)
++    if isinstance(getattr(agent, "_primary_runtime", None), dict):
++        agent._primary_runtime["reasoning_config"] = deepcopy(agent.reasoning_config)
++
++
++def _orchestrator_model(cfg, provider):
++    entry = cfg["providers"].get(provider)
++    if entry:
++        return entry["orchestrator_model"]
++    return cfg.get("initial_model") if provider == cfg["initial_provider"] else cfg.get("manual_model")
++
++
++def _start_choice(cfg, provider, model, complexity, orchestrator, effort=None):
++    alternatives = fallback_candidates(cfg, provider, model, complexity, orchestrator, effort)
++    spec = cfg["providers"].get(provider, {}).get("models", {}).get(model)
++    if spec is None or spec.get("availability") == "unavailable":
++        if not alternatives:
++            raise ValueError("Braia preferred model unavailable; no fallback with known equivalent capacity")
++        candidate = alternatives.pop(0)
++        return candidate["provider"], candidate["model"], alternatives, True
++    if not orchestrator and TIERS[spec["tier"]] < TIERS[complexity]:
++        raise ValueError("Braia active model lacks authorized task capacity")
++    return provider, model, alternatives, False
++
++
++def route_fallback(agent, reason):
++    """Called only at provider-call failure boundary; never replays tools."""
++    state = getattr(agent, "_braia_execution", None)
++    if state is None:
++        return None  # native Hermes behavior when routing disabled
++    reason = getattr(reason, "value", reason)
++    if reason not in PROVIDER_ERRORS:
++        return False  # no policy bypass, content/error/unknown retries
++    _finish_attempt(agent, state, reason)
++    if not state["alternatives"]:
++        return False
++    candidate = state["alternatives"].pop(0)
++    try:
++        target = state["cfg"]["providers"][candidate["provider"]]["models"][candidate["model"]]
++        effort = effective_effort(target, state["context"].get("effort"))
++        _switch(agent, candidate["provider"], candidate["model"], state["cfg"], state["profile"], effort)
++    except Exception:
++        return False  # bounded, sanitized; credentials never enter history
++    # A fallback may benefit from work already done by the first provider.
++    # Keep its verdict for audit, but never compare partial latency/quality
++    # against an independently completed task to promote provider priority.
++    state["context"] = {**state["context"], "_continuation": True}
++    state["id"] = state["store"].begin(state["cfg"], state["context"], agent.provider, agent.model, owner=state.get("owner"))
++    state["ids"].append(state["id"])
++    state["started"] = time.monotonic()
++    state["tokens_start"] = _observed_tokens(agent)
++    agent._braia_last_route = (agent.provider, agent.model)
++    agent._fallback_chain = []
++    agent._fallback_index = 0
++    agent._fallback_activated = False
++    return True
++
++
++def routed_conversation(method):
++    @wraps(method)
++    def wrapped(agent, *args, **kwargs):
++        cfg = load_policy(agent)
++        if cfg is None:
++            return method(agent, *args, **kwargs)
++        # A per-agent nonblocking lock rejects overlapping turns before switching.
++        with _LOCKS_GUARD:
++            lock = getattr(agent, "_braia_turn_lock", None)
++            if lock is None:
++                lock = threading.Lock()
++                agent._braia_turn_lock = lock
++        if not lock.acquire(blocking=False):
++            raise ValueError("Braia concurrent turn on same agent refused")
++        state = None
++        try:
++            profile = profile_for(agent)
++            context = getattr(agent, "braia_task_context", None)
++            if getattr(agent, "_delegate_depth", 0) == 0:
++                context = getattr(agent, "_braia_next_context", None) or context
++                agent._braia_next_context = None
++                agent.braia_task_context = None
++            classified = isinstance(context, dict)
++            context = deepcopy(context) if classified else {"task_type": "unclassified", "complexity": "normal", "acceptance_id": "unclassified-v1"}
++            context_key(context, cfg)
++            store = Store(profile)
++            child = getattr(agent, "_delegate_depth", 0) > 0
++            inflight = bool(getattr(agent, "_braia_inflight_children", {}))
++            provider = agent.provider
++            model = agent.model
++            decision = "active_parent_family"
++            if not child and not inflight:
++                # External /model changes persist in this session. Automatic
++                # switches stamp _braia_last_route and never masquerade as manual.
++                last = getattr(agent, "_braia_last_route", None)
++                initial_route = (cfg["initial_provider"], cfg.get("initial_model") or _orchestrator_model(cfg, cfg["initial_provider"]))
++                if (last is None and (provider, model) != initial_route
++                        and provider in cfg["providers"] and model in cfg["providers"][provider]["models"]
++                        and not getattr(agent, "_fallback_activated", False)):
++                    agent._braia_manual_route = (provider, model)
++                if last is not None and last != (provider, model):
++                    agent._braia_manual_route = (provider, model)
++                manual_route = getattr(agent, "_braia_manual_route", None)
++                if manual_route:
++                    provider, model = manual_route
++                    decision = "manual_session"
++                elif cfg.get("manual_provider"):
++                    provider, decision = cfg["manual_provider"], "manual"
++                    model = _orchestrator_model(cfg, provider)
++                else:
++                    available = []
++                    for candidate, entry in cfg["providers"].items():
++                        candidate_model = entry["orchestrator_model"]
++                        if not any(TIERS[s["tier"]] >= TIERS[context["complexity"]] and s.get("availability") != "unavailable" for s in entry["models"].values()):
++                            continue
++                        try:
++                            _runtime(candidate, candidate_model, profile)
++                            available.append(candidate)
++                        except Exception:
++                            pass
++                    provider, decision = (store.choose(cfg, context, available) if classified else (cfg["initial_provider"], "initial_unclassified"))
++                    model = _orchestrator_model(cfg, provider)
++            requested_effort = context.get("effort") if child else None
++            provider, model, alternatives, disconnected = _start_choice(cfg, provider, model, context["complexity"], not child, requested_effort)
++            if disconnected:
++                decision = "availability_fallback"
++            if (provider, model) != (agent.provider, agent.model) or (not child and not inflight):
++                try:
++                    _switch(agent, provider, model, cfg, profile, requested_effort)
++                except Exception:
++                    if not alternatives:
++                        raise ValueError("Braia preferred provider unavailable; no capable fallback") from None
++                    candidate = alternatives.pop(0)
++                    _switch(agent, candidate["provider"], candidate["model"], cfg, profile, requested_effort)
++                    decision = "availability_fallback"
++            agent._braia_last_route = (agent.provider, agent.model)
++            agent._fallback_chain = []  # prevent native unbounded/wrong-capacity chain
++            agent._fallback_index = 0
++            agent._fallback_activated = False
++            if not child:
++                context["_role"] = "orchestrator"
++            # Captured at child construction, before any execution or fallback.
++            # Root executions never become reviewable child executions.
++            owner = getattr(agent, "_braia_execution_owner", None) if child else None
++            execution_id = store.begin(cfg, context, agent.provider, agent.model, owner=owner)
++            state = {"id": execution_id, "ids": [execution_id], "cfg": cfg, "profile": profile,
++                     "context": context, "store": store, "started": time.monotonic(), "alternatives": alternatives,
++                     "tokens_start": _observed_tokens(agent), "owner": owner}
++            agent._braia_execution = state
++            agent._braia_last_evidence = None
++            result = method(agent, *args, **kwargs)
++            status = "runtime_error" if not isinstance(result, dict) or result.get("error") or result.get("failed") or result.get("completed") is False else "completed"
++            if isinstance(result, dict) and result.get("interrupted"):
++                status = "interrupted"
++            _finish_attempt(agent, state, status)
++            evidence = {"execution_id": state["id"], "attempt_ids": state["ids"],
++                        "provider": agent.provider, "model": agent.model,
++                        "decision": decision, "quality": "unreviewed",
++                        "continuation": bool(state["context"].get("_continuation", False))}
++            agent._braia_last_evidence = evidence
++            if isinstance(result, dict):
++                result["braia_routing"] = evidence
++            return result
++        except BaseException:
++            if state is not None:
++                _finish_attempt(agent, state, "runtime_error")
++                agent._braia_last_evidence = {
++                    "execution_id": state["id"], "attempt_ids": list(state["ids"]),
++                    "provider": agent.provider, "model": agent.model,
++                    "decision": decision, "quality": "unreviewed",
++                    "continuation": bool(state["context"].get("_continuation", False)),
++                }
++            raise
++        finally:
++            agent._braia_execution = None
++            lock.release()
++            if getattr(agent, "_braia_lifecycle_done", False):
++                owner = getattr(agent, "_braia_owner_ref", lambda: None)()
++                if owner is not None:
++                    finish_child(agent, owner)
++    return wrapped
++
++
++def publish_child_evidence(child, parent, entry):
++    evidence = getattr(child, "_braia_last_evidence", None)
++    if not isinstance(evidence, dict):
++        return
++    entry["braia_routing"] = deepcopy(evidence)
++
++
++def track_child(child, parent):
++    """Independent of native _active_children, which detaches async workers."""
++    child._braia_execution_owner = (
++        session_owner(parent) if profile_for(child) == profile_for(parent) else None
++    )
++    with _LOCKS_GUARD:
++        children = getattr(parent, "_braia_inflight_children", None)
++        if not isinstance(children, dict):
++            children = {}
++            parent._braia_inflight_children = children
++        children[id(child)] = child
++        child._braia_lifecycle_done = False
++        try:
++            child._braia_owner_ref = weakref.ref(parent)
++        except TypeError:
++            child._braia_owner_ref = lambda: parent
++
++
++def finish_child(child, parent):
++    with _LOCKS_GUARD:
++        child._braia_lifecycle_done = True
++        lock = getattr(child, "_braia_turn_lock", None)
++        if lock is not None and lock.locked():
++            return  # timed-out worker still unwinding: keep parent fenced
++        children = getattr(parent, "_braia_inflight_children", None)
++        if isinstance(children, dict):
++            children.pop(id(child), None)
++
++
++def control_action(action, message, parent):
++    """Root orchestrator validates actual artifact; child self-approval denied."""
++    if getattr(parent, "_delegate_depth", 0) != 0:
++        raise ValueError("Braia routing controls require the root orchestrator")
++    cfg = load_policy(parent)
++    if cfg is None:
++        raise ValueError("Braia routing is disabled")
++    try:
++        data = json.loads(message)
++    except (TypeError, ValueError):
++        raise ValueError("Braia routing control message must be a JSON object") from None
++    if not isinstance(data, dict):
++        raise ValueError("Braia routing control message must be a JSON object")
++    if action in {"route", "route_next"}:
++        context_key(data, cfg)
++        if not getattr(parent, "_braia_route_batch_safe", False):
++            raise ValueError("Braia route must be the only tool call in its batch")
++        if getattr(parent, "_active_children", []) or getattr(parent, "_braia_inflight_children", {}):
++            raise ValueError("Braia route cannot interrupt active children; wait for their completion")
++        context = {k: data[k] for k in ("task_type", "complexity", "acceptance_id")}
++        profile = profile_for(parent)
++        available = []
++        for provider, entry in cfg["providers"].items():
++            spec = entry["models"][entry["orchestrator_model"]]
++            if spec.get("availability") == "unavailable" or not any(TIERS[s["tier"]] >= TIERS[context["complexity"]] and s.get("availability") != "unavailable" for s in entry["models"].values()):
++                continue
++            try:
++                _runtime(provider, entry["orchestrator_model"], profile)
++                available.append(provider)
++            except Exception:
++                pass
++        store = Store(profile)
++        provider, decision = store.choose(cfg, context, available)
++        manual_route = getattr(parent, "_braia_manual_route", None)
++        if manual_route:
++            provider, model = manual_route
++            decision = "manual_session"
++        else:
++            model = _orchestrator_model(cfg, provider)
++        provider, model, alternatives, disconnected = _start_choice(cfg, provider, model, context["complexity"], True)
++        if disconnected:
++            decision = "availability_fallback"
++        try:
++            _switch(parent, provider, model, cfg, profile)
++        except Exception:
++            if not alternatives:
++                raise ValueError("Braia planned provider unavailable; no capable fallback") from None
++            candidate = alternatives.pop(0)
++            _switch(parent, candidate["provider"], candidate["model"], cfg, profile)
++            decision = "availability_fallback"
++        state = getattr(parent, "_braia_execution", None)
++        context["_role"] = "orchestrator"
++        if state is not None:
++            _finish_attempt(parent, state, "completed")
++            state["id"] = store.begin(cfg, context, parent.provider, parent.model)
++            state["ids"].append(state["id"])
++            state.update(context=context, started=time.monotonic(), alternatives=alternatives, tokens_start=_observed_tokens(parent))
++        parent._braia_last_route = (parent.provider, parent.model)
++        parent._fallback_chain = []
++        parent._fallback_index = 0
++        parent._fallback_activated = False
++        return {"status": "routed", "applies": "planned_task_boundary", "active_provider": parent.provider,
++                "orchestrator_model": parent.model, "decision": decision,
++                "models": cfg["providers"][parent.provider]["models"]}
++    if action != "review":
++        raise ValueError("Braia unknown routing action")
++    execution_id = data.get("execution_id")
++    owner = session_owner(parent)
++    profile = profile_for(parent)
++    if owner is None or not isinstance(execution_id, str) or not re.fullmatch(r"[0-9a-f]{32}", execution_id):
++        raise ValueError("Braia review requires an execution owned by this parent/profile/session")
++    store = Store(profile)
++    with store.tx() as db:
++        row = db.execute("SELECT owner FROM executions WHERE id=?", (execution_id,)).fetchone()
++        if row is None or row["owner"] != owner:
++            raise ValueError("Braia review requires an execution owned by this parent/profile/session")
++    artifact = Path(data.get("evidence_path", ""))
++    if not artifact.is_absolute() or artifact.is_symlink() or not artifact.is_file():
++        raise ValueError("Braia evidence_path must be an existing absolute artifact file")
++    if artifact.stat().st_size > 20 * 1024 * 1024:
++        raise ValueError("Braia evidence artifact exceeds 20 MiB")
++    # Do not emit contents, paths or their raw digest to routing history.
++    actual = hashlib.sha256(artifact.read_bytes()).hexdigest()
++    if actual != data.get("evidence_sha256"):
++        raise ValueError("Braia evidence digest does not match artifact")
++    store.verdict(execution_id, data.get("verdict"), actual,
++                  data.get("verifier"), data.get("rework", 0), owner=owner)
++    return {"status": "recorded", "execution_id": execution_id, "verdict": data["verdict"],
++            "basis": "explicit_orchestrator_review_of_hashed_artifact"}
++
++
++def async_result_lines(result):
++    """Render runtime metadata separately from truncated model summaries.
++
++    Rendering conveys IDs, never grants authority: review checks Store.owner.
++    """
++    evidence = result.get("braia_routing")
++    if not isinstance(evidence, dict):
++        return []
++    fields = {k: evidence[k] for k in ("execution_id", "attempt_ids", "provider", "model", "quality", "continuation") if k in evidence}
++    return ["Braia runtime evidence: " + json.dumps(fields, ensure_ascii=True),
++            "Quality is unreviewed. Verify the deliverable against its acceptance criteria, then use delegate_task(action=review) with this execution_id and a real evidence artifact/SHA256."]
++
++
++ROUTING_SCHEMA = {
++    "type": "object",
++    "properties": {
++        "model": {"type": "string", "description": "Authorized model in ACTIVE parent provider family; see braia_routing catalog in task context."},
++        "effort": {"type": ["string", "null"], "description": "Model-supported reasoning effort, null for configured model default; never invent support."},
++        "task_type": {"type": "string", "description": "Non-sensitive routine slug, e.g. sdr-extraction."},
++        "complexity": {"type": "string", "enum": list(TIERS)},
++        "justification": {"type": "string", "description": "Explain scope, ambiguity, dependencies, impact and verification; no keyword/length classifier."},
++        "acceptance_id": {"type": "string", "description": "Versioned verifiable acceptance criterion slug."},
++    },
++    "required": ["model", "effort", "task_type", "complexity", "justification", "acceptance_id"],
++    "additionalProperties": False,
++}
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index c67550de78..4ec26e226b 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -3513,7 +3513,7 @@ def run_conversation(
+                     # Eager fallback: empty/malformed responses are a common
+                     # rate-limit symptom.  Switch to fallback immediately
+                     # rather than retrying with extended backoff.
+-                    if agent._fallback_index < len(agent._fallback_chain):
++                    if agent._has_pending_fallback():
+                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
+                     if agent._try_activate_fallback():
+                         active_system_prompt = _sync_failover_system_message(
+@@ -3981,7 +3981,7 @@ def run_conversation(
+                         )
+                         if (
+                             _cf_terminated
+-                            and agent._fallback_index < len(agent._fallback_chain)
++                            and agent._has_pending_fallback()
+                         ):
+                             agent._vprint(
+                                 f"{agent.log_prefix}🛡️  Content filter terminated "
+@@ -5593,7 +5593,12 @@ def run_conversation(
+                     (is_rate_limited and _wrapped_output_cap_budget is None)
+                     or (_is_transport_failure and retry_count >= 2)
+                 )
+-                if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
++                _braia_unavailable_model = (
++                    getattr(agent, "_braia_execution", None) is not None
++                    and classified.reason.value in {"model_not_found", "server_error"}
++                )
++                _should_fallback = _should_fallback or _braia_unavailable_model
++                if _should_fallback and agent._has_pending_fallback():
+                     # Don't eagerly fallback if credential pool rotation may
+                     # still recover.  See _pool_may_recover_from_rate_limit
+                     # for the single-credential-pool exception.  Fixes #11314.
+@@ -5604,7 +5609,7 @@ def run_conversation(
+                     # different model regardless of pool state.
+                     _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
+                     pool_may_recover = (
+-                        False if _is_upstream
++                        False if (_is_upstream or _braia_unavailable_model)
+                         else _ra()._pool_may_recover_from_rate_limit(
+                             agent._credential_pool,
+                         )
+@@ -5663,7 +5668,7 @@ def run_conversation(
+                 if (
+                     classified.is_auth
+                     and not _retry.auth_failover_attempted
+-                    and agent._fallback_index < len(agent._fallback_chain)
++                    and agent._has_pending_fallback()
+                 ):
+                     _retry.auth_failover_attempted = True
+                     agent._buffer_status(
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 7990d88ad2..689f3e2e1c 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2087,7 +2087,9 @@ DEFAULT_CONFIG = {
+     # so child agents can run on a different (cheaper/faster) provider and model.
+     # Uses the same runtime provider resolution as CLI/gateway startup, so all
+     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
++    "braia_routing": {"enabled": False},
+     "delegation": {
++        "fallback_providers": None,  # legacy explicit child fallback chain
+         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
+         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
+diff --git a/run_agent.py b/run_agent.py
+index 9f145baddf..cffec5c979 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -917,7 +917,7 @@ class AIAgent:
+     ):
+         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
+         from agent.agent_runtime_helpers import switch_model
+-        return switch_model(
++        switched = switch_model(
+             self,
+             new_model,
+             new_provider,
+@@ -926,6 +926,10 @@ class AIAgent:
+             api_mode,
+             capabilities,
+         )
++        if (switched is not False and self.provider == new_provider and self.model == new_model
++                and not getattr(self, "_braia_automatic_switch", False)):
++            self._braia_manual_route = (new_provider, new_model)
++        return switched
+ 
+     def _safe_print(self, *args, **kwargs):
+         """Print that silently handles broken pipes / closed stdout.
+@@ -7112,6 +7116,10 @@ class AIAgent:
+ 
+     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
++        from agent.braia_routing import route_fallback
++        routed = route_fallback(self, reason)
++        if routed is not None:
++            return routed
+         from agent.chat_completion_helpers import try_activate_fallback
+         return try_activate_fallback(self, reason)
+ 
+@@ -7123,6 +7131,9 @@ class AIAgent:
+         fallback chain configured).  Mirrors the early-return guard in
+         ``try_activate_fallback`` (#35314, #17446).
+         """
++        state = getattr(self, "_braia_execution", None)
++        if state is not None:
++            return bool(state["alternatives"])
+         chain = getattr(self, "_fallback_chain", None) or []
+         index = getattr(self, "_fallback_index", 0)
+         return index < len(chain)
+@@ -8530,6 +8541,7 @@ class AIAgent:
+         while side-effect ordering is preserved.
+         """
+         tool_calls = assistant_message.tool_calls
++        self._braia_route_batch_safe = len(tool_calls) == 1
+ 
+         # Allow _vprint during tool execution even with stream consumers
+         self._executing_tools = True
+@@ -8561,6 +8573,7 @@ class AIAgent:
+             )
+         finally:
+             self._executing_tools = False
++            self._braia_route_batch_safe = False
+ 
+     def _dispatch_delegate_task(self, function_args: dict) -> str:
+         """Single call site for delegate_task dispatch.
+@@ -8687,6 +8700,9 @@ class AIAgent:
+                 logger.debug("Conversation root lineage walk failed", exc_info=True)
+         return start
+ 
++    from agent.braia_routing import routed_conversation as _braia_routed_conversation
++
++    @_braia_routed_conversation
+     def run_conversation(
+         self,
+         user_message: Any,
+diff --git a/tools/async_delegation.py b/tools/async_delegation.py
+index ea0757143d..e4410efaf5 100644
+--- a/tools/async_delegation.py
++++ b/tools/async_delegation.py
+@@ -992,6 +992,7 @@ def _push_completion_event(
+         "dispatched_at": dispatched_at,
+         "completed_at": completed_at,
+         "exit_reason": result.get("exit_reason"),
++        "braia_routing": result.get("braia_routing"),
+     }
+     # Routing origin captured at dispatch (see _capture_routing_origin):
+     # additive, lets the gateway reconstruct a full SessionSource (incl.
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index e459344a83..0216bd448f 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -1722,6 +1722,7 @@ def _build_child_agent(
+     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
+     # toolset subject to depth/kill-switch bounds applied below.
+     role: str = "leaf",
++    routing_spec: Optional[Dict[str, Any]] = None,
+ ):
+     """
+     Build a child AIAgent on the main thread (thread-safe construction).
+@@ -1975,23 +1976,28 @@ def _build_child_agent(
+     except Exception as exc:
+         logger.debug("Could not load delegation reasoning_effort: %s", exc)
+ 
+-    # Inherit the parent's fallback provider chain so subagents can recover
+-    # from rate-limits and credential exhaustion exactly like the top-level
+-    # agent does.  _fallback_chain is a list accepted by AIAgent's
+-    # fallback_model parameter (which handles both list and dict forms).
+-    #
+-    # EXCEPT when the user pinned delegation.provider: an explicit pin means
+-    # "children run on THIS provider".  Inheriting the parent chain would let
+-    # a mid-run auth/429 failure silently reroute the quiet-mode child onto
+-    # the parent's fallback models with no surfaced signal (#80450) — the
+-    # same class of silent-drag the override_provider filter-clearing below
+-    # already prevents for OpenRouter routing preferences.  Predictability >
+-    # liveness for explicit pins: the pinned child fails loudly instead.
+-    parent_fallback = (
+-        None
+-        if override_provider
+-        else (getattr(parent_agent, "_fallback_chain", None) or None)
+-    )
++    # Legacy explicit chain remains supported when dynamic routing is disabled.
++    child_fallback = delegation_cfg.get("fallback_providers")
++    if child_fallback is None:
++        child_fallback = None if override_provider else (getattr(parent_agent, "_fallback_chain", None) or None)
++    else:
++        if not isinstance(child_fallback, list) or any(
++            not isinstance(entry, dict)
++            or not isinstance(entry.get("provider"), str) or not entry["provider"].strip()
++            or not isinstance(entry.get("model"), str) or not entry["model"].strip()
++            for entry in child_fallback
++        ):
++            raise ValueError("delegation.fallback_providers must be a list of provider/model mappings")
++        from copy import deepcopy
++        child_fallback = deepcopy(child_fallback)
++    if routing_spec is not None:
++        from agent.braia_routing import load_policy, reasoning_for
++        routing_policy = load_policy(parent_agent)
++        child_reasoning = reasoning_for(
++            routing_policy["providers"][effective_provider]["models"][effective_model],
++            routing_spec["effort"],
++        )
++        child_fallback = []  # runtime hook supplies bounded capable fallbacks
+ 
+     # Inherit the parent's OpenRouter provider-preference filters by default
+     # (so subagents routed to the same provider honour the same routing
+@@ -2081,7 +2087,7 @@ def _build_child_agent(
+ 
+                 reasoning_config=child_reasoning,
+                 prefill_messages=getattr(parent_agent, "prefill_messages", None),
+-                fallback_model=parent_fallback,
++                fallback_model=child_fallback,
+                 enabled_toolsets=child_toolsets,
+                 disabled_toolsets=child_disabled_toolsets,
+                 quiet_mode=True,
+@@ -2128,6 +2134,10 @@ def _build_child_agent(
+                 except Exception:
+                     pass
+             raise
++    if routing_spec is not None:
++        from agent.braia_routing import profile_for
++        child.braia_task_context = dict(routing_spec)
++        child._braia_profile = str(profile_for(parent_agent))
+     child._print_fn = getattr(parent_agent, "_print_fn", None)
+     # Ownership transfer for the dedicated handle: the child's close() must
+     # release it (nothing else holds a reference), and no parent teardown can
+@@ -2207,6 +2217,9 @@ def _build_child_agent(
+     except Exception:
+         logger.debug("subagent_start hook invocation failed", exc_info=True)
+ 
++    if routing_spec is not None:
++        from agent.braia_routing import track_child
++        track_child(child, parent_agent)
+     return child
+ 
+ 
+@@ -3079,6 +3092,8 @@ def _run_single_child(
+                     f"{_late_pending_steer}]"
+                 )
+             _attach_worktree(_error_entry)
++            from agent.braia_routing import publish_child_evidence
++            publish_child_evidence(child, parent_agent, _error_entry)
+             return _error_entry
+         finally:
+             # Shut down executor without waiting — if the child thread
+@@ -3469,6 +3484,8 @@ def _run_single_child(
+                 logger.debug("Progress callback completion failed: %s", e)
+ 
+         _attach_worktree(entry)
++        from agent.braia_routing import publish_child_evidence
++        publish_child_evidence(child, parent_agent, entry)
+         return entry
+ 
+     except Exception as exc:
+@@ -3505,9 +3522,13 @@ def _run_single_child(
+             )
+         # _attach_worktree defaults to a no-op when isolation never engaged.
+         _attach_worktree(_error_entry)
++        from agent.braia_routing import publish_child_evidence
++        publish_child_evidence(child, parent_agent, _error_entry)
+         return _error_entry
+ 
+     finally:
++        from agent.braia_routing import finish_child
++        finish_child(child, parent_agent)
+         # Stop the heartbeat thread so it doesn't keep touching parent activity
+         # after the child has finished (or failed).  Guard the join: .start()
+         # now lives inside the try block, so if it raised (OS thread
+@@ -3851,6 +3872,12 @@ def delegate_task(
+     # They never spawn, so they bypass the pause gate, depth limit, and the
+     # async dispatch machinery entirely.
+     normalized_action = (action or "").strip().lower()
++    if normalized_action in {"route", "route_next", "review"}:
++        from agent.braia_routing import control_action
++        try:
++            return json.dumps(control_action(normalized_action, message, parent_agent))
++        except (ValueError, OSError) as exc:
++            return tool_error(str(exc))
+     if normalized_action in _CONTROL_ACTIONS:
+         return _handle_control_action(
+             normalized_action, subagent_id, message, parent_agent
+@@ -3922,8 +3949,10 @@ def delegate_task(
+     # uses it to route its reviewer subagent onto ``auxiliary.review``
+     # without touching the global delegation pin.
+     try:
++        from agent.braia_routing import load_policy, validate_task
++        routing_policy = load_policy(parent_agent)
+         creds = _resolve_delegation_credentials(
+-            credentials_cfg if credentials_cfg else cfg, parent_agent
++            {} if routing_policy else (credentials_cfg if credentials_cfg else cfg), parent_agent
+         )
+     except ValueError as exc:
+         return tool_error(str(exc))
+@@ -4004,6 +4033,18 @@ def delegate_task(
+             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
+         task_schemas.append(coerced_schema)
+ 
++    task_routes = [None] * len(task_list)
++    task_credentials = [creds] * len(task_list)
++    if routing_policy:
++        try:
++            # Freeze family for this dispatch; validate every task BEFORE any child.
++            active_provider = parent_agent.provider
++            task_routes = [validate_task(t, active_provider, routing_policy) for t in task_list]
++            task_credentials = [_resolve_delegation_credentials({"model": route["model"]}, parent_agent)
++                                for route in task_routes]
++        except ValueError as exc:
++            return tool_error(str(exc))
++
+     overall_start = time.monotonic()
+     results = []
+ 
+@@ -4054,6 +4095,7 @@ def delegate_task(
+     # subagent-lifecycle API).
+     children = []
+     for i, t in enumerate(task_list):
++        creds = task_credentials[i]
+         # Per-task role beats top-level; normalise again so unknown
+         # per-task values warn and degrade to leaf uniformly.
+         effective_role = _normalize_role(t.get("role") or top_role)
+@@ -4086,8 +4128,23 @@ def delegate_task(
+                 override_acp_command=creds.get("command"),
+                 override_acp_args=creds.get("args"),
+                 role=effective_role,
++                routing_spec=task_routes[i],
+             )
+-        except ValueError as exc:
++        except BaseException as exc:
++            if routing_policy:
++                from agent.braia_routing import finish_child
++                for _, _, orphan in children:
++                    finish_child(orphan, parent_agent)
++                    try:
++                        orphan.close()
++                    except Exception:
++                        pass
++                    try:
++                        parent_agent._active_children.remove(orphan)
++                    except (AttributeError, ValueError):
++                        pass
++            if not isinstance(exc, ValueError):
++                raise  # preserve native propagation after cleaning unstarted children
+             # Explicit-pin preflight failures (e.g. pinned delegation.command
+             # missing from PATH) refuse the spawn loudly (#80450).
+             return tool_error(str(exc))
+@@ -5079,10 +5136,27 @@ def _build_dynamic_schema_overrides() -> dict:
+     }
+     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+ 
+-    return {
+-        "description": _build_top_level_description(),
+-        "parameters": overrides_params,
+-    }
++    from copy import deepcopy
++    from agent.braia_routing import load_policy, ROUTING_SCHEMA
++    policy = load_policy()
++    if policy:
++        overrides_params = deepcopy(overrides_params)
++        item = overrides_params["properties"]["tasks"]["items"]
++        item["properties"]["routing"] = deepcopy(ROUTING_SCHEMA)
++        item["required"] = ["goal", "routing"]
++        catalog = {provider: entry["models"] for provider, entry in policy["providers"].items()}
++        item["properties"]["routing"]["description"] = "Select within the ACTIVE parent family. Authorized candidate catalog (availability may be unverified): " + json.dumps(catalog)
++        overrides_params["properties"]["action"]["enum"] += ["route", "review"]
++        overrides_params["properties"]["message"]["description"] += (
++            " Root only: route message is JSON {task_type,complexity,acceptance_id}; call ALONE before delegating a planned task, with no active children. Selects provider at this task boundary and returns its model catalog. "
++            "review message is JSON {execution_id,verdict:accepted|rejected,evidence_path,evidence_sha256,verifier,rework}; "
++            "verify a child's deliverable against acceptance criteria FIRST, then cite an actual artifact and SHA256. "
++            "Generated text/HTTP200/schema validity alone is not quality acceptance."
++        )
++    description = _build_top_level_description()
++    if policy:
++        description += " Braia routing enabled: every task requires model/effort/type/complexity/justification/acceptance_id in routing; active-parent family overrides legacy delegation pins."
++    return {"description": description, "parameters": overrides_params}
+ 
+ 
+ DELEGATE_TASK_SCHEMA = {
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 4ef3177fb3..c9e950ac0e 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -3155,6 +3155,8 @@ def _format_async_delegation(evt: dict) -> str:
+                 header += ", TRUNCATED: hit max_iterations — work may be incomplete"
+             header += ") ---"
+             lines.append(header)
++            from agent.braia_routing import async_result_lines
++            lines.extend(async_result_lines(r))
+             if r_status in ("completed", "success") and r_summary:
+                 if r_truncated:
+                     lines.append(
+@@ -3207,6 +3209,8 @@ def _format_async_delegation(evt: dict) -> str:
+         lines.extend(_notice)
+     _trunc = " [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""
+     lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s{_trunc}")
++    from agent.braia_routing import async_result_lines
++    lines.extend(async_result_lines(evt))
+     lines.append("--- RESULT ---")
+     if status in ("completed", "success") and summary:
+         if truncated:
