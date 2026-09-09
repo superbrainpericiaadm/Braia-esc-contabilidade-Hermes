@@ -722,6 +722,7 @@ def test_detached_background_child_blocks_route_until_actual_completion(cfg, con
 
 
 def test_first_turn_explicit_model_beats_initial_preference(cfg, tmp_path):
+    cfg["manual_provider"] = "anthropic"
     a = agent(tmp_path); a.provider = "openai-codex"; a.model = "gpt-normal"
     a.requested_provider = "openai-codex"
     @br.routed_conversation
@@ -730,6 +731,28 @@ def test_first_turn_explicit_model_beats_initial_preference(cfg, tmp_path):
         result = run(a)
     assert result["provider_seen"] == "openai-codex"
     assert result["braia_routing"]["decision"] == "manual_session"
+
+
+def test_initial_disconnected_fallback_preserves_explicit_effort(cfg, context, tmp_path):
+    cfg.update(initial_model="claude-normal", initial_tier="normal")
+    del cfg["providers"]["anthropic"]
+    cfg = br.validate_policy(cfg)
+    a = agent(tmp_path)
+    a._delegate_depth = 1
+    a.braia_task_context = {**context, "model": "claude-normal", "effort": "high"}
+    captured = []
+    def capture_switch(agent, provider, model, policy, profile, effort=None):
+        captured.append(effort)
+        switch(agent, provider, model, policy, profile, effort)
+    @br.routed_conversation
+    def run(agent):
+        return {"completed": True}
+    with patch.object(br, "load_policy", return_value=cfg), \
+         patch.object(br, "_runtime", return_value={}), \
+         patch.object(br, "_switch", side_effect=capture_switch):
+        result = run(a)
+    assert result["braia_routing"]["provider"] == "openai-codex"
+    assert captured[0] == "high"
 
 
 def test_new_parent_turn_does_not_switch_while_detached_child_active(cfg, tmp_path):

@@ -356,7 +356,10 @@ def _transition(root, before, expected, identity, backup):
     current = dict(before)
     try:
         for name, desired in expected.items():
-            if desired is None or (before[name] is not None and before[name]['data'] == desired[0]):
+            if desired is None or (before[name] is not None
+                                   and before[name]['data'] == desired[0]
+                                   and (os.name == 'nt' or bool(before[name]['mode'] & 0o111)
+                                        == bool(desired[1] & 0o111))):
                 continue
             path = _safe_path(root / name)
             for directory in reversed(path.parent.parents):
@@ -368,6 +371,10 @@ def _transition(root, before, expected, identity, backup):
                 created_dirs.append(path.parent)
             parent = path.parent.stat()
             metadata = before[name] or {'mode': desired[1], 'uid': parent.st_uid, 'gid': parent.st_gid}
+            if before[name] is not None and os.name != 'nt':
+                metadata = dict(metadata)
+                metadata['mode'] = ((metadata['mode'] & ~0o111)
+                                    | (desired[1] & 0o111))
             prepared[name] = _replacement(path, desired[0], metadata)
             staged = prepared[name].stat()
             intended_metadata[name] = (stat.S_IMODE(staged.st_mode), staged.st_uid, staged.st_gid)

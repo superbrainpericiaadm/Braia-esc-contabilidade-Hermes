@@ -16,8 +16,8 @@ import yaml
 
 PROVIDERS = ("openai-codex", "anthropic")
 POLICY_VERSION = "braia-routing-v1"
-# Reviewed candidates supplement stale Hermes catalogs, never treated as proof
-# of an account entitlement. Unknown models require a reviewed policy update.
+# Offline floor only. Live Hermes catalogs are authoritative for connected
+# subscriptions, so newly offered models do not require an installer release.
 MODEL_POLICY = {
     "openai-codex": {
         "gpt-5.6-luna": "routine", "gpt-5.6-terra": "normal",
@@ -35,22 +35,45 @@ LEARNING_DEFAULTS = dict(enabled=True, min_samples=8, window_days=30,
                          sustained_windows=2)
 
 
+def infer_tier(provider, model):
+    name = model.lower()
+    if any(token in name for token in ("luna", "mini", "haiku")):
+        return "routine"
+    if any(token in name for token in ("astra", "fable")):
+        return "exceptional"
+    if any(token in name for token in ("sol", "opus")):
+        return "complex"
+    return "normal"
+
+
+def effort_capabilities(provider, model, tier):
+    if provider == "anthropic":
+        return [] if tier == "routine" else ["low", "medium", "high"]
+    try:
+        from agent.reasoning_effort import codex_supported_efforts
+        return list(codex_supported_efforts(model))
+    except Exception:
+        return ["none", "low", "medium", "high", "xhigh"]
+
+
 def discover_catalog(providers):
     from hermes_cli.models import curated_models_for_provider
     catalog = {}
     for provider in providers:
         try:
-            ids = {item[0] for item in curated_models_for_provider(provider)}
+            ids = list(dict.fromkeys(item[0] for item in curated_models_for_provider(provider)))
         except Exception:
             # Discovery may fail offline; reviewed candidates remain unverified.
-            ids = set()
+            ids = []
+        candidates = list(ids) if ids else list(MODEL_POLICY[provider])
         models = {}
-        for model, tier in MODEL_POLICY[provider].items():
-            efforts = [] if tier == "routine" and provider == "anthropic" else ["low", "medium", "high"]
+        for model in candidates:
+            tier = MODEL_POLICY[provider].get(model, infer_tier(provider, model))
+            efforts = effort_capabilities(provider, model, tier)
             models[model] = dict(tier=tier, efforts=efforts,
-                                 default_effort="medium" if efforts else None,
+                                 default_effort="medium" if "medium" in efforts else efforts[0] if efforts else None,
                                  availability="unverified",
-                                 source="hermes" if model in ids else "reviewed_policy")
+                                 source="hermes" if ids else "reviewed_policy")
         catalog[provider] = {"models": models}
     return catalog
 
@@ -67,11 +90,10 @@ def validate_catalog(catalog, providers):
         for model, raw in block["models"].items():
             if not isinstance(model, str) or not isinstance(raw, dict):
                 raise ValueError("INVALID_CATALOG: model entry")
-            # Exact names, known provider and reviewed capabilities are required.
-            if model not in MODEL_POLICY[provider] or raw.get("tier") != MODEL_POLICY[provider][model]:
-                raise ValueError("INVALID_CATALOG: unknown model or mismatched capability")
+            if raw.get("tier") not in TIERS:
+                raise ValueError("INVALID_CATALOG: model capability tier")
             efforts = raw.get("efforts")
-            if not isinstance(efforts, list) or any(e not in {"low", "medium", "high", "max", "xhigh"} for e in efforts):
+            if not isinstance(efforts, list) or any(e not in {"none", "low", "medium", "high", "max", "xhigh"} for e in efforts):
                 raise ValueError("INVALID_CATALOG: effort capabilities")
             if provider == "anthropic" and raw["tier"] == "routine" and efforts:
                 raise ValueError("INVALID_CATALOG: Haiku has no adaptive effort")
@@ -135,7 +157,7 @@ def build_config(original, has_codex, has_claude, catalog=None):
     resolved = validate_catalog(catalog if catalog is not None else discover_catalog(providers), providers)
     chosen = cfg["model"].get("provider")
     if chosen is None and cfg["model"].get("default"):
-        matches = [p for p in PROVIDERS if cfg["model"]["default"] in MODEL_POLICY[p]]
+        matches = [p for p in PROVIDERS if cfg["model"]["default"] in resolved.get(p, {}).get("models", {})]
         if len(matches) != 1:
             raise ValueError("SELECT_AVAILABLE_MODEL: saved model needs an explicit subscription provider")
         chosen = matches[0]
@@ -170,7 +192,12 @@ def build_config(original, has_codex, has_claude, catalog=None):
                 raise ValueError("Invalid provider preference entry")
             model = entry.get("orchestrator_model")
             if model is not None:
-                if not isinstance(model, str) or model not in MODEL_POLICY[provider]:
+                known = set(MODEL_POLICY[provider])
+                known.update(resolved.get(provider, {}).get("models", {}))
+                prior_models = previous.get(provider, {}).get("models", {})
+                if isinstance(prior_models, dict):
+                    known.update(prior_models)
+                if not isinstance(model, str) or model not in known:
                     raise ValueError("SELECT_AVAILABLE_MODEL: invalid saved orchestrator")
                 preferences[provider] = {"orchestrator_model": model}
     if chosen and cfg["model"].get("default"):
@@ -195,11 +222,14 @@ def build_config(original, has_codex, has_claude, catalog=None):
                   providers=resolved, provider_preferences=preferences)
     policy.setdefault("initial_model", cfg["model"]["default"] if chosen == initial else
                       resolved.get(initial, {}).get("orchestrator_model"))
-    policy.setdefault("initial_tier", MODEL_POLICY[initial].get(policy.get("initial_model")))
+    initial_model = policy.get("initial_model")
+    initial_spec = resolved.get(initial, {}).get("models", {}).get(initial_model, {})
+    policy.setdefault("initial_tier", initial_spec.get("tier") or infer_tier(initial, initial_model or ""))
     if manual:
         manual_model = (cfg["model"]["default"] if chosen == manual else
                         preferences.get(manual, {}).get("orchestrator_model"))
-        manual_tier = MODEL_POLICY[manual].get(manual_model)
+        manual_tier = (resolved.get(manual, {}).get("models", {}).get(manual_model, {}).get("tier")
+                       or (infer_tier(manual, manual_model) if manual_model else None))
         if manual_tier:
             policy["manual_tier"] = manual_tier
         elif manual == initial:

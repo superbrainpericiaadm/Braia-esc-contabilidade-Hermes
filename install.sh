@@ -16,6 +16,7 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER_TMP=""
 INSTALL_SUCCEEDED=false
 SERVICE_UNIT_TRANSACTIONAL=false
+readonly INSTALL_LOCK_PATH="/run/lock/hermes-contadoria-installer.lock"
 
 cleanup() {
   local status=$?
@@ -30,8 +31,8 @@ cleanup() {
   if [[ "${INSTALL_SUCCEEDED}" != true && "${SERVICE_STATE_CAPTURED:-false}" == true ]]; then
     if ! quiesce_service_for_recovery; then
       printf 'ERRO: não foi possível manter o serviço parado durante a recuperação.\n' >&2
-      recovery_ok=false
-      status=1
+      printf 'ERRO: recuperação abortada sem novas mutações; intervenção manual necessária.\n' >&2
+      exit 1
     fi
     if ! rollback_kit_artifacts; then
       printf 'ERRO: não foi possível reverter os artefatos do kit.\n' >&2
@@ -67,6 +68,9 @@ trap cleanup EXIT
 fail() { printf 'ERRO: %s\n' "$*" >&2; exit 1; }
 
 [[ "${EUID}" -eq 0 ]] || fail "execute como root: sudo bash install.sh"
+command -v flock >/dev/null || fail "flock é obrigatório para serializar instalações"
+exec {INSTALL_LOCK_FD}>"${INSTALL_LOCK_PATH}" || fail "não foi possível abrir o lock global"
+flock -n "${INSTALL_LOCK_FD}" || fail "outra instalação/recuperação já está em andamento"
 [[ -r /etc/os-release ]] || fail "não foi possível identificar o sistema operacional"
 # shellcheck disable=SC1091
 source /etc/os-release
@@ -84,6 +88,7 @@ for required in \
   "${SOURCE_DIR}/scripts/apply_runtime_patch.py" \
   "${SOURCE_DIR}/scripts/configure_multi_ai.py" \
   "${SOURCE_DIR}/scripts/install_kit_artifacts.sh" \
+  "${SOURCE_DIR}/scripts/secure_artifact.py" \
   "${SOURCE_DIR}/scripts/runtime_transaction.sh" \
   "${SOURCE_DIR}/scripts/service_transaction.sh" \
   "${SOURCE_DIR}/runtime-patches/delegation-fallback.patch" \
@@ -170,6 +175,12 @@ printf '>> Aplicando extensão revisada de roteamento por tarefa...\n'
 install -d -m 0700 -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" "${HERMES_HOME}/backups/runtime"
 "${RUNTIME_DIR}/venv/bin/python" "${SOURCE_DIR}/scripts/apply_runtime_patch.py" \
   --runtime "${RUNTIME_DIR}" --backup-root "${HERMES_HOME}/backups/runtime"
+if [[ -f "${KIT_MARKER}" ]]; then
+  printf '>> Migrando a configuração preservada para a política de roteamento atual...\n'
+  register_kit_artifact_target "${HERMES_HOME}/config.yaml" "${SERVICE_USER}" "${SERVICE_GROUP}"
+  HERMES_HOME="${HERMES_HOME}" "${RUNTIME_DIR}/venv/bin/python" \
+    "${SOURCE_DIR}/scripts/configure_multi_ai.py"
+fi
 chown -R "root:${SERVICE_GROUP}" "${RUNTIME_DIR}"
 chmod -R g+rX,o-rwx "${RUNTIME_DIR}"
 

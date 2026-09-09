@@ -7,20 +7,6 @@ import pytest
 import yaml
 
 
-HERMES_TOOLS = {
-    "read_file", "write_file", "patch", "search_files", "terminal",
-    "web_search", "web_extract", "delegate_task", "skill_view",
-    "skills_list", "skill_manage", "memory", "session_search", "cronjob",
-    "text_to_speech", "clarify",
-}
-
-FORBIDDEN_SKILL_TERMS = (
-    "Agent tool", "system-reminder", "tmux", "outbox", "inbox/",
-    "/opt/braia", "psql", "braia_memory", "pgvector", "consolidate.py",
-    "search.py", "--dangerously-skip-permissions", "CLAUDE.md", ".claude/",
-    "mcp__google-workspace__", "~/.claude/plugins",
-)
-
 CONFIG_KEYS = {
     "owner_name", "owner_full_name", "owner_email", "owner_telegram_id", "owner_title",
     "business_name", "institutional_email", "calendar_tag",

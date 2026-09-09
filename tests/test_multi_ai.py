@@ -8,7 +8,7 @@ from unittest.mock import patch
 import sys
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 
-from configure_multi_ai import build_config, connected, atomic_write, validate_catalog, discover_catalog, MODEL_POLICY
+from configure_multi_ai import build_config, connected, atomic_write, validate_catalog, discover_catalog
 import configure_multi_ai as configure
 
 spec = importlib.util.spec_from_file_location("claude_login", Path(__file__).parents[1] / "skills/braia-claude-login/scripts/claude_login.py")
@@ -243,10 +243,9 @@ class MultiAI(unittest.TestCase):
         self.assertEqual(cfg["braia_routing"]["learning"]["min_samples"], 20)
         self.assertEqual(cfg["auxiliary"], original["auxiliary"])
 
-    def test_catalog_rejects_unknown_foreign_and_wrong_capabilities(self):
-        for name, entry in [("gpt-voice-guess", {"tier": "normal", "efforts": []}),
-                            ("gpt-5.6-terra", {"tier": "complex", "efforts": []}),
-                            ("claude-opus-5", {"tier": "complex", "efforts": []})]:
+    def test_catalog_rejects_invalid_capabilities(self):
+        for name, entry in [("gpt-voice", {"tier": "unknown", "efforts": []}),
+                            ("gpt-5.6-terra", {"tier": "normal", "efforts": ["invalid"]})]:
             catalog = copy.deepcopy(self.catalog)
             catalog["openai-codex"]["models"][name] = entry
             with self.assertRaisesRegex(ValueError, "INVALID_CATALOG"):
@@ -278,12 +277,21 @@ class MultiAI(unittest.TestCase):
         native.curated_models_for_provider = lambda p: [("gpt-5.6-terra", ""), ("gpt-5.4-mini", ""), ("gpt-new-guess", "")]
         with patch.dict(sys.modules, {"hermes_cli.models": native}):
             catalog = discover_catalog(["openai-codex"])
-        self.assertEqual(set(catalog["openai-codex"]["models"]), set(MODEL_POLICY["openai-codex"]))
+        self.assertEqual(set(catalog["openai-codex"]["models"]), {"gpt-5.6-terra", "gpt-5.4-mini", "gpt-new-guess"})
         self.assertEqual(catalog["openai-codex"]["models"]["gpt-5.6-terra"]["availability"], "unverified")
         self.assertEqual(catalog["openai-codex"]["models"]["gpt-5.6-terra"]["source"], "hermes")
-        self.assertEqual(catalog["openai-codex"]["models"]["gpt-5.6-sol"]["source"], "reviewed_policy")
-        self.assertNotIn("gpt-5.4-mini", catalog["openai-codex"]["models"])
-        self.assertNotIn("gpt-new-guess", catalog["openai-codex"]["models"])
+        self.assertEqual(catalog["openai-codex"]["models"]["gpt-5.4-mini"]["tier"], "routine")
+        self.assertEqual(catalog["openai-codex"]["models"]["gpt-new-guess"]["tier"], "normal")
+
+    def test_live_chatgpt_catalog_accepts_gpt_5_5_as_orchestrator(self):
+        catalog = {"openai-codex": {"models": {
+            "gpt-5.5": {"tier": "normal", "efforts": ["none", "low", "medium", "high", "xhigh"],
+                        "default_effort": "medium", "source": "hermes"},
+        }}}
+        cfg, _ = build_config({"model": {"provider": "openai-codex", "default": "gpt-5.5"}},
+                              True, False, catalog)
+        self.assertEqual(cfg["model"]["default"], "gpt-5.5")
+        self.assertEqual(cfg["braia_routing"]["providers"]["openai-codex"]["orchestrator_model"], "gpt-5.5")
 
     def test_offline_catalog_keeps_opus_and_optional_fable_without_second_login(self):
         from types import ModuleType

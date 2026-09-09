@@ -555,3 +555,14 @@ def test_custom_permissions_and_owner_survive_apply_and_rollback(fixture_runtime
         after = (root / name).stat()
         assert stat.S_IMODE(after.st_mode) == 0o640
         assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX executable bits')
+def test_executable_bit_drift_is_reconciled(fixture_runtime):
+    helper, root, patch, backup, git = fixture_runtime
+    path = root / TARGETS[0]
+    path.chmod(0o744)
+    assert helper.install(root, patch, backup, check=True)['status'] == 'ready'
+    assert helper.install(root, patch, backup)['status'] == 'applied'
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert helper.install(root, patch, backup)['status'] == 'already_applied'

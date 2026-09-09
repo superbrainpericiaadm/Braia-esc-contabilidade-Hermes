@@ -1,6 +1,22 @@
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 7990d88ad2..765f4f8828 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2088,6 +2088,9 @@ DEFAULT_CONFIG = {
+     # Uses the same runtime provider resolution as CLI/gateway startup, so all
+     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
+     "delegation": {
++        # Explicit child fallback chain (provider/model mappings), even with
++        # a pinned provider. None preserves inheritance; [] disables fallback.
++        "fallback_providers": None,
+         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
+         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index e459344a83..40dba54e09 100644
 --- a/tools/delegate_tool.py
 +++ b/tools/delegate_tool.py
-@@ -1975,23 +1975,31 @@
+@@ -1975,23 +1975,31 @@ def _build_child_agent(
      except Exception as exc:
          logger.debug("Could not load delegation reasoning_effort: %s", exc)
  
@@ -49,7 +65,7 @@
  
      # Inherit the parent's OpenRouter provider-preference filters by default
      # (so subagents routed to the same provider honour the same routing
-@@ -2081,7 +2089,7 @@
+@@ -2081,7 +2089,7 @@ def _build_child_agent(
  
                  reasoning_config=child_reasoning,
                  prefill_messages=getattr(parent_agent, "prefill_messages", None),
@@ -58,15 +74,3 @@
                  enabled_toolsets=child_toolsets,
                  disabled_toolsets=child_disabled_toolsets,
                  quiet_mode=True,
---- a/hermes_cli/config_defaults.py
-+++ b/hermes_cli/config_defaults.py
-@@ -2088,6 +2088,9 @@
-     # Uses the same runtime provider resolution as CLI/gateway startup, so all
-     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
-     "delegation": {
-+        # Explicit child fallback chain (provider/model mappings), even with
-+        # a pinned provider. None preserves inheritance; [] disables fallback.
-+        "fallback_providers": None,
-         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
-         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
-         "base_url": "",    # direct OpenAI-compatible endpoint for subagents

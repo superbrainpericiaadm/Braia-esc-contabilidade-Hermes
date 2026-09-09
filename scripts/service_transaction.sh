@@ -22,10 +22,24 @@ capture_service_state() {
 }
 
 stop_service_for_update() {
+  local status
   [[ "${SERVICE_STATE_CAPTURED}" == true ]] || return 1
-  if [[ "${SERVICE_PREVIOUS_STATE}" == active ]]; then
+  if systemctl is-active --quiet "${SERVICE_NAME}"; then
     printf '>> Parando temporariamente o serviço para atualização transacional...\n'
-    systemctl stop "${SERVICE_NAME}"
+  else
+    status=$?
+    [[ "${status}" == 3 || "${status}" == 4 ]] || return "${status}"
+    if [[ "${SERVICE_PREVIOUS_STATE}" == absent && "${status}" == 4 ]]; then
+      return 0
+    fi
+  fi
+  # Stop unconditionally: an inactive service may have started since capture.
+  systemctl stop "${SERVICE_NAME}" || return 1
+  if systemctl is-active --quiet "${SERVICE_NAME}"; then
+    return 1
+  else
+    status=$?
+    [[ "${status}" == 3 || "${status}" == 4 ]]
   fi
 }
 

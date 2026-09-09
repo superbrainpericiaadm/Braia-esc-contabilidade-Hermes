@@ -13,6 +13,11 @@ FRESH_HOME_PREVIOUS_PATH=""
 FRESH_HOME_PREVIOUS_EXISTED=false
 FRESH_HOME_RENAME_COMPLETED=false
 FRESH_HOME_ARCHIVE_PATH=""
+SAFE_ARTIFACT_HELPER="${SAFE_ARTIFACT_HELPER:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/secure_artifact.py}"
+
+safe_artifact() {
+  python3 "${SAFE_ARTIFACT_HELPER}" "$@"
+}
 
 begin_fresh_home_transaction() {
   local home="$1" backup_root="$2" staging_parent
@@ -80,28 +85,11 @@ archive_home_transaction_snapshot() {
 }
 
 assert_safe_artifact_target() {
-  local target="$1" current="/" part
-  [[ "${target}" == /* ]] || return 1
-  IFS='/' read -r -a parts <<< "${target#/}"
-  for part in "${parts[@]:0:${#parts[@]}-1}"; do
-    [[ -n "${part}" ]] || continue
-    current="${current%/}/${part}"
-    [[ ! -L "${current}" ]] || return 1
-  done
-  [[ ! -L "${target}" ]] || return 1
-  [[ ! -e "${target}" || -f "${target}" ]] || return 1
+  safe_artifact validate-file "$1"
 }
 
 assert_safe_artifact_directory() {
-  local target="$1" current="/" part
-  [[ "${target}" == /* ]] || return 1
-  IFS='/' read -r -a parts <<< "${target#/}"
-  for part in "${parts[@]}"; do
-    [[ -n "${part}" ]] || continue
-    current="${current%/}/${part}"
-    [[ ! -L "${current}" ]] || return 1
-  done
-  [[ ! -e "${target}" || -d "${target}" ]] || return 1
+  safe_artifact validate-directory "$1"
 }
 
 begin_kit_artifact_transaction() {
@@ -127,7 +115,7 @@ register_kit_artifact_target() {
   index="${#KIT_ARTIFACT_TARGETS[@]}"
   backup="${KIT_ARTIFACT_BACKUP_ROOT}/${index}"
   if [[ -f "${target}" ]]; then
-    cp -p -- "${target}" "${backup}" || return
+    safe_artifact copy "${target}" "${backup}" || return
     existing=true
   else
     existing=false
@@ -138,21 +126,14 @@ register_kit_artifact_target() {
 }
 
 atomic_install_artifact() {
-  local source="$1" target="$2" mode="$3" owner="$4" group="$5" temporary
-  assert_safe_artifact_target "${target}" || return 1
-  temporary="$(mktemp --tmpdir="$(dirname "${target}")" ".$(basename "${target}").new.XXXXXX")" || return
-  KIT_ARTIFACT_TEMPORARIES+=("${temporary}")
-  install -m "${mode}" -o "${owner}" -g "${group}" "${source}" "${temporary}" || return
-  mv -fT -- "${temporary}" "${target}" || return
+  local source="$1" target="$2" mode="$3" owner="$4" group="$5" uid gid
+  uid="$(id -u "${owner}")" || return
+  gid="$(getent group "${group}" | cut -d: -f3)" || return
+  safe_artifact copy "${source}" "${target}" --mode "${mode}" --uid "${uid}" --gid "${gid}"
 }
 
 atomic_restore_artifact() {
-  local source="$1" target="$2" temporary
-  assert_safe_artifact_target "${target}" || return 1
-  temporary="$(mktemp --tmpdir="$(dirname "${target}")" ".$(basename "${target}").rollback.XXXXXX")" || return
-  KIT_ARTIFACT_TEMPORARIES+=("${temporary}")
-  cp -p -- "${source}" "${temporary}" || return
-  mv -fT -- "${temporary}" "${target}" || return
+  safe_artifact copy "$1" "$2"
 }
 
 cleanup_kit_artifact_temporaries() {
@@ -173,8 +154,8 @@ rollback_kit_artifacts() {
     backup="${KIT_ARTIFACT_BACKUPS[index]}"
     if [[ "${KIT_ARTIFACT_EXISTED[index]}" == true ]]; then
       atomic_restore_artifact "${backup}" "${target}" || failed=true
-    elif [[ -f "${target}" || -L "${target}" ]]; then
-      unlink -- "${target}" || failed=true
+    else
+      safe_artifact remove "${target}" || failed=true
     fi
   done
   cleanup_kit_artifact_temporaries || failed=true

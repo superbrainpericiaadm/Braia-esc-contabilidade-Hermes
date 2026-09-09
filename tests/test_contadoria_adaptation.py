@@ -44,15 +44,13 @@ def test_routing_policy_has_expected_invariants():
     assert "fallback_providers" not in cfg
 
 
-def test_contabil_identity_and_no_pericial_roster_import():
+def test_contabil_identity_and_expected_public_roster():
     soul = (ROOT / "templates/SOUL.md").read_text(encoding="utf-8")
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     for name in ("Victor", "Daiane", "Agnaldo", "Silvana", "Paulo", "Isaura", "Angélica", "Juliana"):
         assert name in soul
         assert name in agents
-    for imported in ("agente-rebeca-pericia", "agente-rogerio", "equipe-braia-pericias"):
-        assert imported not in soul
-        assert imported not in agents
+    assert set(AGENT_HASHES) == {path.name for path in (ROOT / "agents").glob("*.md")}
 
 
 def test_installer_pins_reviewed_runtime_and_installs_extension():
@@ -164,8 +162,38 @@ def test_failure_preserves_previously_inactive_service(tmp_path):
     result, state, events = _run_failed_service_transaction(tmp_path, "inactive")
     assert result.returncode == 41
     assert state == "inactive"
-    assert "stop hermes-contadoria.service" not in events
+    assert "stop hermes-contadoria.service" in events
     assert "start hermes-contadoria.service" not in events
+
+
+def test_service_start_between_capture_and_stop_is_quiesced(tmp_path):
+    state = tmp_path / "state"
+    events = tmp_path / "events"
+    state.write_text("inactive")
+    script = r'''
+set -u
+SERVICE_NAME=hermes-contadoria.service
+STATE_FILE="$1"; EVENTS_FILE="$2"; HELPER="$3"
+systemctl() {
+  printf '%s\n' "$*" >> "$EVENTS_FILE"
+  case "$1" in
+    is-active) [[ "$(<"$STATE_FILE")" == active ]] || return 3 ;;
+    stop) printf inactive > "$STATE_FILE" ;;
+    *) return 64 ;;
+  esac
+}
+. "$HELPER"
+capture_service_state
+printf active > "$STATE_FILE"
+stop_service_for_update
+'''
+    result = subprocess.run([
+        "bash", "-c", script, "race-test", str(state), str(events),
+        str(ROOT / "scripts/service_transaction.sh"),
+    ], check=False)
+    assert result.returncode == 0
+    assert state.read_text() == "inactive"
+    assert "stop hermes-contadoria.service" in events.read_text().splitlines()
 
 
 def test_failed_update_rolls_back_artifacts_before_service_can_observe_them(tmp_path):
@@ -290,7 +318,7 @@ set -u
 . "$HELPER"
 begin_kit_artifact_transaction "$BACKUP" "$OWNER" "$GROUP" || exit
 register_kit_artifact_target "$TARGET_FILE" "$OWNER" "$GROUP" || exit
-install() { return 73; }
+safe_artifact() { return 73; }
 atomic_install_artifact "$SOURCE_FILE" "$TARGET_FILE" 0644 "$OWNER" "$GROUP"
 '''
     result = subprocess.run(
@@ -311,7 +339,7 @@ def test_artifact_restore_failure_never_replaces_live_target(tmp_path):
     command = r'''
 set -u
 . "$HELPER"
-cp() { return 74; }
+safe_artifact() { return 74; }
 atomic_restore_artifact "$SOURCE_FILE" "$TARGET_FILE"
 '''
     result = subprocess.run(
@@ -321,6 +349,97 @@ atomic_restore_artifact "$SOURCE_FILE" "$TARGET_FILE"
     )
     assert result.returncode == 74
     assert target.read_text() == "new"
+
+
+def test_artifact_paths_reject_lexical_traversal(tmp_path):
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    command = '. "$HELPER"; assert_safe_artifact_target "$TARGET"'
+    result = subprocess.run(["bash", "-c", command], env={
+        **os.environ, "HELPER": str(ROOT / "scripts/install_kit_artifacts.sh"),
+        "TARGET": str(managed / "sub" / ".." / "escaped"),
+    })
+    assert result.returncode != 0
+
+
+def test_absent_artifact_rollback_removes_concurrent_empty_directory(tmp_path):
+    target = tmp_path / "target"
+    backup = tmp_path / "backup"
+    user = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    command = r'''
+. "$HELPER"
+begin_kit_artifact_transaction "$BACKUP" "$OWNER" "$GROUP"
+register_kit_artifact_target "$TARGET" "$OWNER" "$GROUP"
+mkdir "$TARGET"
+rollback_kit_artifacts
+'''
+    result = subprocess.run(["bash", "-c", command], env={
+        **os.environ, "HELPER": str(ROOT / "scripts/install_kit_artifacts.sh"),
+        "BACKUP": str(backup), "OWNER": user, "GROUP": group, "TARGET": str(target),
+    })
+    assert result.returncode == 0
+    assert not target.exists()
+
+
+def test_absent_artifact_rollback_reports_nonempty_directory(tmp_path):
+    target = tmp_path / "target"
+    backup = tmp_path / "backup"
+    user = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    command = r'''
+. "$HELPER"
+begin_kit_artifact_transaction "$BACKUP" "$OWNER" "$GROUP"
+register_kit_artifact_target "$TARGET" "$OWNER" "$GROUP"
+mkdir "$TARGET"; printf concurrent > "$TARGET/item"
+rollback_kit_artifacts
+'''
+    result = subprocess.run(["bash", "-c", command], env={
+        **os.environ, "HELPER": str(ROOT / "scripts/install_kit_artifacts.sh"),
+        "BACKUP": str(backup), "OWNER": user, "GROUP": group, "TARGET": str(target),
+    })
+    assert result.returncode != 0
+    assert (target / "item").read_text() == "concurrent"
+
+
+def test_secure_artifact_parent_swap_never_writes_through_symlink(tmp_path):
+    import importlib.util
+    helper_path = ROOT / "scripts/secure_artifact.py"
+    spec = importlib.util.spec_from_file_location("secure_artifact", helper_path)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    managed = tmp_path / "managed"
+    displaced = tmp_path / "displaced"
+    outside = tmp_path / "outside"
+    managed.mkdir(); outside.mkdir()
+    source = tmp_path / "source"; source.write_text("new")
+    (outside / "target").write_text("outside-safe")
+    original = helper._copy_fd
+    def swap(source_fd, destination_fd):
+        managed.rename(displaced)
+        managed.symlink_to(outside, target_is_directory=True)
+        original(source_fd, destination_fd)
+    helper._copy_fd = swap
+    helper.atomic_copy(str(source), str(managed / "target"), 0o600, os.getuid(), os.getgid())
+    assert (outside / "target").read_text() == "outside-safe"
+    assert (displaced / "target").read_text() == "new"
+
+
+def test_installer_has_global_lock_and_fail_closed_recovery_order():
+    install = (ROOT / "install.sh").read_text(encoding="utf-8")
+    assert "flock -n" in install
+    assert install.index("flock -n") < install.index("apt-get update")
+    failure = install.index("recuperação abortada sem novas mutações")
+    assert failure < install.index("rollback_kit_artifacts")
+    assert 'exit 1' in install[failure:install.index("rollback_kit_artifacts")]
+
+
+def test_existing_install_runs_routing_migration_transactionally():
+    install = (ROOT / "install.sh").read_text(encoding="utf-8")
+    start = install.index(">> Migrando")
+    migration = install.index('"${SOURCE_DIR}/scripts/configure_multi_ai.py"', start)
+    assert install.rfind('register_kit_artifact_target "${HERMES_HOME}/config.yaml"', 0, migration) >= 0
+    assert install.index("apply_runtime_patch.py", install.index(">> Aplicando")) < migration
 
 
 def test_runtime_failure_restores_exact_previous_tree(tmp_path):
